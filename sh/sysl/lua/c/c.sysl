@@ -1,0 +1,469 @@
+// Lua 5.4's C API as `lua.h`, `lauxlib.h` and `lualib.h` declare it, and nothing else.
+//
+// **Every name is the C name**, `lua_`, `luaL_` and `luaopen_` prefixes included. This layer is the
+// reference manual's §4 and §5 transcribed, and a reader holding the manual should find each entry
+// by searching for the name printed there. The module above, `sh.sysl.lua`, is the one a program
+// names; this one is what it is built from.
+//
+// **The function-like macros are sysl functions here** (`lua_pop`, `lua_pcall`, `lua_tostring`,
+// `lua_upvalueindex` and the rest of §4.6's list), each written as the header's own expansion, so the
+// manual's examples translate call for call. A macro whose expansion needs a string literal pasted at
+// compile time (`lua_pushliteral`) or a C array's element count (`luaL_newlib`) is the one shape that
+// has no function form, and the note at each says what to write instead.
+//
+// ## The one rule this layer cannot enforce: an error is a `longjmp`
+//
+// **A Lua error unwinds by `longjmp`, through whatever frames lie between the raise and the nearest
+// `lua_pcall`.** A C frame loses nothing that way. A sysl frame holding a count — a `string`, a
+// `Buf`, any `&T` — never gives it back, because nothing runs its cleanup. So a `lua_CFunction`
+// written in sysl raises only from a frame that holds nothing, and calls anything that MAY raise — a
+// metamethod run by `lua_gettable`, `lua_settable`, `lua_len`, `lua_concat`, `lua_compare` or
+// `lua_arith`; any `luaL_check*`; an allocation failing anywhere — only from such a frame too. The
+// module above is arranged that way: every sysl frame Lua can unwind through holds raw pointers and
+// integers and nothing else.
+//
+// **The four functions that always raise answer `never` and are NOT `@abandons`.** `@abandons`
+// says a call leaves *every* frame below it, and the compiler then refuses to take the address of
+// any function that reaches one — which would forbid exactly the `lua_CFunction` that calls
+// `lua_error`, the API's central pattern. A Lua error leaves only the frames up to a `pcall` that C
+// set, so the annotation describes something stronger than what happens. Without it the rule above
+// is the binding's to keep rather than the compiler's to check.
+//
+// **The library is vendored, and is compiled from `c/lua/` as Lua 5.4.9 shipped it.** `sysl.hocon`
+// says why, and which macros configure it.
+
+module sh.sysl.lua.c
+
+@include("stddef.h")
+@include("lua.h")
+@include("lauxlib.h")
+@include("lualib.h")
+
+// ## Basic types (manual §4.1, §4.4)
+
+// The whole interpreter state, per thread. A coroutine is a `State` too, sharing its globals with the
+// state that made it.
+opaque struct State
+
+// `lua_Number`, `lua_Integer`, `lua_Unsigned` and `lua_KContext` are configured in `luaconf.h`; the
+// defaults are `double`, `long long`, `unsigned long long` and `intptr_t`, and `tests.sysl` measures
+// each against the header so a different configuration fails a test rather than a call.
+type Number = f64
+type Integer = i64
+type Unsigned = u64
+type KContext = isize
+
+c const
+    NUMBER_SIZE:   usize = "sizeof(lua_Number)"
+    INTEGER_SIZE:  usize = "sizeof(lua_Integer)"
+    UNSIGNED_SIZE: usize = "sizeof(lua_Unsigned)"
+    KCONTEXT_SIZE: usize = "sizeof(lua_KContext)"
+    INTEGER_MAX:   i64   = "LUA_MAXINTEGER"
+
+// ## The callback signatures (manual §4.6)
+//
+// None carries an aggregate, so a plain top-level sysl function with this signature has an address
+// that C can call; no `@export` is needed for any of them.
+type CFunction = *extern(*State) -> int
+type KFunction = *extern(*State, int, KContext) -> int
+type Reader = *extern(*State, *u8, *usize) -> *u8
+type Writer = *extern(*State, *u8, usize, *u8) -> int
+type Alloc = *extern(*u8, *u8, usize, usize) -> *u8
+type WarnFunction = *extern(*u8, *u8, int) -> unit
+type Hook = *extern(*State, *Debug) -> unit
+
+// ## Version and limits
+
+c const
+    LUA_VERSION_NUM:         int = "LUA_VERSION_NUM"
+    LUA_VERSION_RELEASE_NUM: int = "LUA_VERSION_RELEASE_NUM"
+    LUA_MULTRET:             int = "LUA_MULTRET"
+    LUA_REGISTRYINDEX:       int = "LUA_REGISTRYINDEX"
+    LUA_MINSTACK:            int = "LUA_MINSTACK"
+    LUAI_MAXSTACK:           int = "LUAI_MAXSTACK"
+    LUA_IDSIZE:              int = "LUA_IDSIZE"
+    LUA_EXTRASPACE:          usize = "LUA_EXTRASPACE"
+    LUAL_BUFFERSIZE:         usize = "LUAL_BUFFERSIZE"
+    LUAL_NUMSIZES:           usize = "LUAL_NUMSIZES"
+
+// The registry's two predefined slots (manual §4.3).
+c const
+    LUA_RIDX_MAINTHREAD: Integer = "LUA_RIDX_MAINTHREAD"
+    LUA_RIDX_GLOBALS:    Integer = "LUA_RIDX_GLOBALS"
+
+// ## Status codes
+
+c const
+    LUA_OK:        int = "LUA_OK"
+    LUA_YIELD:     int = "LUA_YIELD"
+    LUA_ERRRUN:    int = "LUA_ERRRUN"
+    LUA_ERRSYNTAX: int = "LUA_ERRSYNTAX"
+    LUA_ERRMEM:    int = "LUA_ERRMEM"
+    LUA_ERRERR:    int = "LUA_ERRERR"
+    LUA_ERRFILE:   int = "LUA_ERRFILE"
+
+// ## Basic types of a value
+
+c const
+    LUA_TNONE:          int = "LUA_TNONE"
+    LUA_TNIL:           int = "LUA_TNIL"
+    LUA_TBOOLEAN:       int = "LUA_TBOOLEAN"
+    LUA_TLIGHTUSERDATA: int = "LUA_TLIGHTUSERDATA"
+    LUA_TNUMBER:        int = "LUA_TNUMBER"
+    LUA_TSTRING:        int = "LUA_TSTRING"
+    LUA_TTABLE:         int = "LUA_TTABLE"
+    LUA_TFUNCTION:      int = "LUA_TFUNCTION"
+    LUA_TUSERDATA:      int = "LUA_TUSERDATA"
+    LUA_TTHREAD:        int = "LUA_TTHREAD"
+    LUA_NUMTYPES:       int = "LUA_NUMTYPES"
+
+// ## Arithmetic and comparison operators (`lua_arith`, `lua_compare`)
+
+c const
+    LUA_OPADD:  int = "LUA_OPADD"
+    LUA_OPSUB:  int = "LUA_OPSUB"
+    LUA_OPMUL:  int = "LUA_OPMUL"
+    LUA_OPMOD:  int = "LUA_OPMOD"
+    LUA_OPPOW:  int = "LUA_OPPOW"
+    LUA_OPDIV:  int = "LUA_OPDIV"
+    LUA_OPIDIV: int = "LUA_OPIDIV"
+    LUA_OPBAND: int = "LUA_OPBAND"
+    LUA_OPBOR:  int = "LUA_OPBOR"
+    LUA_OPBXOR: int = "LUA_OPBXOR"
+    LUA_OPSHL:  int = "LUA_OPSHL"
+    LUA_OPSHR:  int = "LUA_OPSHR"
+    LUA_OPUNM:  int = "LUA_OPUNM"
+    LUA_OPBNOT: int = "LUA_OPBNOT"
+    LUA_OPEQ:   int = "LUA_OPEQ"
+    LUA_OPLT:   int = "LUA_OPLT"
+    LUA_OPLE:   int = "LUA_OPLE"
+
+// ## Garbage-collection options (`lua_gc`)
+
+c const
+    LUA_GCSTOP:       int = "LUA_GCSTOP"
+    LUA_GCRESTART:    int = "LUA_GCRESTART"
+    LUA_GCCOLLECT:    int = "LUA_GCCOLLECT"
+    LUA_GCCOUNT:      int = "LUA_GCCOUNT"
+    LUA_GCCOUNTB:     int = "LUA_GCCOUNTB"
+    LUA_GCSTEP:       int = "LUA_GCSTEP"
+    LUA_GCSETPAUSE:   int = "LUA_GCSETPAUSE"
+    LUA_GCSETSTEPMUL: int = "LUA_GCSETSTEPMUL"
+    LUA_GCISRUNNING:  int = "LUA_GCISRUNNING"
+    LUA_GCGEN:        int = "LUA_GCGEN"
+    LUA_GCINC:        int = "LUA_GCINC"
+
+// ## Debug events and masks
+
+c const
+    LUA_HOOKCALL:     int = "LUA_HOOKCALL"
+    LUA_HOOKRET:      int = "LUA_HOOKRET"
+    LUA_HOOKLINE:     int = "LUA_HOOKLINE"
+    LUA_HOOKCOUNT:    int = "LUA_HOOKCOUNT"
+    LUA_HOOKTAILCALL: int = "LUA_HOOKTAILCALL"
+    LUA_MASKCALL:     int = "LUA_MASKCALL"
+    LUA_MASKRET:      int = "LUA_MASKRET"
+    LUA_MASKLINE:     int = "LUA_MASKLINE"
+    LUA_MASKCOUNT:    int = "LUA_MASKCOUNT"
+
+// ## The auxiliary library's references (`luaL_ref`)
+
+c const
+    LUA_NOREF:  int = "LUA_NOREF"
+    LUA_REFNIL: int = "LUA_REFNIL"
+
+// **The header's string macros are transcribed rather than measured**, because a `c const` reads
+// numbers and a string constant is storage, not a number. Each is a name Lua itself looks up, so the
+// tests check them by asking Lua for what is stored under them.
+val LUA_GNAME = "_G"
+val LUA_LOADED_TABLE = "_LOADED"
+val LUA_PRELOAD_TABLE = "_PRELOAD"
+val LUA_FILEHANDLE = "FILE*"
+val LUA_COLIBNAME = "coroutine"
+val LUA_TABLIBNAME = "table"
+val LUA_IOLIBNAME = "io"
+val LUA_OSLIBNAME = "os"
+val LUA_STRLIBNAME = "string"
+val LUA_UTF8LIBNAME = "utf8"
+val LUA_MATHLIBNAME = "math"
+val LUA_DBLIBNAME = "debug"
+val LUA_LOADLIBNAME = "package"
+
+// ## State manipulation (manual §4.6)
+
+extern lua_newstate(f: Alloc, ud: *u8) -> *State
+extern lua_close(L: *State)
+extern lua_newthread(L: *State) -> *State
+extern lua_closethread(L: *State, from: *State) -> int
+extern lua_resetthread(L: *State) -> int
+extern lua_atpanic(L: *State, panicf: CFunction) -> CFunction
+extern lua_version(L: *State) -> Number
+
+// ## Basic stack manipulation
+
+extern lua_absindex(L: *State, idx: int) -> int
+extern lua_gettop(L: *State) -> int
+extern lua_settop(L: *State, idx: int)
+extern lua_pushvalue(L: *State, idx: int)
+extern lua_rotate(L: *State, idx: int, n: int)
+extern lua_copy(L: *State, fromidx: int, toidx: int)
+extern lua_checkstack(L: *State, n: int) -> int
+extern lua_xmove(from: *State, to: *State, n: int)
+
+// ## Access functions (stack to C)
+
+extern lua_isnumber(L: *State, idx: int) -> int
+extern lua_isstring(L: *State, idx: int) -> int
+extern lua_iscfunction(L: *State, idx: int) -> int
+extern lua_isinteger(L: *State, idx: int) -> int
+extern lua_isuserdata(L: *State, idx: int) -> int
+extern lua_type(L: *State, idx: int) -> int
+extern lua_typename(L: *State, tp: int) -> *u8
+
+extern lua_tonumberx(L: *State, idx: int, isnum: *int) -> Number
+extern lua_tointegerx(L: *State, idx: int, isnum: *int) -> Integer
+extern lua_toboolean(L: *State, idx: int) -> int
+
+// **The answer points into Lua's own string, alive only while the value stays on the stack**, and
+// it converts a number on the stack into a string in place.
+extern lua_tolstring(L: *State, idx: int, len: *usize) -> *u8
+extern lua_rawlen(L: *State, idx: int) -> Unsigned
+extern lua_tocfunction(L: *State, idx: int) -> CFunction
+extern lua_touserdata(L: *State, idx: int) -> *u8
+extern lua_tothread(L: *State, idx: int) -> *State
+extern lua_topointer(L: *State, idx: int) -> *u8
+
+// ## Comparison and arithmetic
+
+extern lua_arith(L: *State, op: int)
+extern lua_rawequal(L: *State, idx1: int, idx2: int) -> int
+extern lua_compare(L: *State, idx1: int, idx2: int, op: int) -> int
+
+// ## Push functions (C to stack)
+
+extern lua_pushnil(L: *State)
+extern lua_pushnumber(L: *State, n: Number)
+extern lua_pushinteger(L: *State, n: Integer)
+extern lua_pushlstring(L: *State, s: *u8, len: usize) -> *u8
+extern lua_pushstring(L: *State, s: *u8) -> *u8
+extern lua_pushvfstring(L: *State, fmt: *u8, argp: va_list) -> *u8
+extern lua_pushfstring(L: *State, fmt: *u8, ...) -> *u8
+extern lua_pushcclosure(L: *State, f: CFunction, n: int)
+extern lua_pushboolean(L: *State, b: int)
+extern lua_pushlightuserdata(L: *State, p: *u8)
+extern lua_pushthread(L: *State) -> int
+
+// ## Get functions (Lua to stack)
+
+extern lua_getglobal(L: *State, name: *u8) -> int
+extern lua_gettable(L: *State, idx: int) -> int
+extern lua_getfield(L: *State, idx: int, k: *u8) -> int
+extern lua_geti(L: *State, idx: int, n: Integer) -> int
+extern lua_rawget(L: *State, idx: int) -> int
+extern lua_rawgeti(L: *State, idx: int, n: Integer) -> int
+extern lua_rawgetp(L: *State, idx: int, p: *u8) -> int
+
+extern lua_createtable(L: *State, narr: int, nrec: int)
+extern lua_newuserdatauv(L: *State, sz: usize, nuvalue: int) -> *u8
+extern lua_getmetatable(L: *State, objindex: int) -> int
+extern lua_getiuservalue(L: *State, idx: int, n: int) -> int
+
+// ## Set functions (stack to Lua)
+
+extern lua_setglobal(L: *State, name: *u8)
+extern lua_settable(L: *State, idx: int)
+extern lua_setfield(L: *State, idx: int, k: *u8)
+extern lua_seti(L: *State, idx: int, n: Integer)
+extern lua_rawset(L: *State, idx: int)
+extern lua_rawseti(L: *State, idx: int, n: Integer)
+extern lua_rawsetp(L: *State, idx: int, p: *u8)
+extern lua_setmetatable(L: *State, objindex: int) -> int
+extern lua_setiuservalue(L: *State, idx: int, n: int) -> int
+
+// ## Load and call
+
+extern lua_callk(L: *State, nargs: int, nresults: int, ctx: KContext, k: KFunction)
+extern lua_pcallk(L: *State, nargs: int, nresults: int, errfunc: int, ctx: KContext, k: KFunction) -> int
+extern lua_load(L: *State, reader: Reader, dt: *u8, chunkname: *u8, mode: *u8) -> int
+extern lua_dump(L: *State, writer: Writer, data: *u8, strip: int) -> int
+
+// ## Coroutines
+
+extern lua_yieldk(L: *State, nresults: int, ctx: KContext, k: KFunction) -> int
+extern lua_resume(L: *State, from: *State, narg: int, nres: *int) -> int
+extern lua_status(L: *State) -> int
+extern lua_isyieldable(L: *State) -> int
+
+// ## Warnings
+
+extern lua_setwarnf(L: *State, f: WarnFunction, ud: *u8)
+extern lua_warning(L: *State, msg: *u8, tocont: int)
+
+// ## Garbage collection
+//
+// **Variadic in C**: `LUA_GCSTEP` takes a step size, `LUA_GCINC` three integers and `LUA_GCGEN`
+// two. Every option's tail is `int`s, which a variadic call carries as written.
+extern lua_gc(L: *State, what: int, ...) -> int
+
+// ## Miscellaneous
+
+// **It raises: the error object on top of the stack is thrown and the call never returns.** C
+// declares it answering `int` so that `return lua_error(L)` reads naturally; nothing is ever answered.
+extern lua_error(L: *State) -> never
+
+extern lua_next(L: *State, idx: int) -> int
+extern lua_concat(L: *State, n: int)
+extern lua_len(L: *State, idx: int)
+extern lua_stringtonumber(L: *State, s: *u8) -> usize
+extern lua_getallocf(L: *State, ud: **u8) -> Alloc
+extern lua_setallocf(L: *State, f: Alloc, ud: *u8)
+extern lua_toclose(L: *State, idx: int)
+extern lua_closeslot(L: *State, idx: int)
+
+// ## The debug interface (manual §4.7)
+//
+// **`lua_Debug` is laid out here field for field**, the private `i_ci` included, because a program
+// allocates one and Lua fills it. `tests.sysl` checks the size and every offset against the header.
+struct Debug
+    event: int
+    name: *u8
+    namewhat: *u8
+    what: *u8
+    source: *u8
+    srclen: usize
+    currentline: int
+    linedefined: int
+    lastlinedefined: int
+    nups: u8
+    nparams: u8
+    isvararg: u8
+    istailcall: u8
+    ftransfer: u16
+    ntransfer: u16
+    short_src: [IDSIZE]u8
+    i_ci: *u8
+
+c const
+    IDSIZE:           usize = "LUA_IDSIZE"
+    DEBUG_SIZE:       usize = "sizeof(lua_Debug)"
+    DEBUG_NAME:       usize = "offsetof(lua_Debug, name)"
+    DEBUG_SRCLEN:     usize = "offsetof(lua_Debug, srclen)"
+    DEBUG_CURRENTLINE: usize = "offsetof(lua_Debug, currentline)"
+    DEBUG_NUPS:       usize = "offsetof(lua_Debug, nups)"
+    DEBUG_FTRANSFER:  usize = "offsetof(lua_Debug, ftransfer)"
+    DEBUG_SHORT_SRC:  usize = "offsetof(lua_Debug, short_src)"
+    DEBUG_I_CI:       usize = "offsetof(lua_Debug, i_ci)"
+
+extern lua_getstack(L: *State, level: int, ar: *Debug) -> int
+extern lua_getinfo(L: *State, what: *u8, ar: *Debug) -> int
+extern lua_getlocal(L: *State, ar: *Debug, n: int) -> *u8
+extern lua_setlocal(L: *State, ar: *Debug, n: int) -> *u8
+extern lua_getupvalue(L: *State, funcindex: int, n: int) -> *u8
+extern lua_setupvalue(L: *State, funcindex: int, n: int) -> *u8
+extern lua_upvalueid(L: *State, fidx: int, n: int) -> *u8
+extern lua_upvaluejoin(L: *State, fidx1: int, n1: int, fidx2: int, n2: int)
+extern lua_sethook(L: *State, f: Hook, mask: int, count: int)
+extern lua_gethook(L: *State) -> Hook
+extern lua_gethookmask(L: *State) -> int
+extern lua_gethookcount(L: *State) -> int
+extern lua_setcstacklimit(L: *State, limit: u32) -> int
+
+// ## The auxiliary library (manual §5)
+
+// One entry of a `luaL_setfuncs` array; the array ends with an entry whose `name` is null.
+struct Reg
+    name: *u8
+    func: CFunction
+
+// A file handle as the `io` library makes one: a `FILE *` and the function that closes it.
+struct Stream
+    f: *u8
+    closef: CFunction
+
+c const
+    REG_SIZE:    usize = "sizeof(luaL_Reg)"
+    STREAM_SIZE: usize = "sizeof(luaL_Stream)"
+
+// **`luaL_Buffer` is caller storage that points into itself** — `b` starts out as the address of
+// the inline `init` area — so one must never be copied once `luaL_buffinit` has run. Declare it as a
+// `var` and pass its address; the module above does.
+struct Buffer
+    b: *u8
+    size: usize
+    n: usize
+    L: *State
+    init: [BUFFER_INIT_WORDS]u64
+
+c const
+    BUFFER_SIZE:       usize = "sizeof(luaL_Buffer)"
+    BUFFER_INIT:       usize = "offsetof(luaL_Buffer, init)"
+    BUFFER_INIT_WORDS: usize = "(sizeof(((luaL_Buffer *)0)->init) + 7) / 8"
+
+extern luaL_checkversion_(L: *State, ver: Number, sz: usize)
+extern luaL_getmetafield(L: *State, obj: int, e: *u8) -> int
+extern luaL_callmeta(L: *State, obj: int, e: *u8) -> int
+extern luaL_tolstring(L: *State, idx: int, len: *usize) -> *u8
+
+extern luaL_argerror(L: *State, arg: int, extramsg: *u8) -> never
+extern luaL_typeerror(L: *State, arg: int, tname: *u8) -> never
+
+extern luaL_checklstring(L: *State, arg: int, l: *usize) -> *u8
+extern luaL_optlstring(L: *State, arg: int, def: *u8, l: *usize) -> *u8
+extern luaL_checknumber(L: *State, arg: int) -> Number
+extern luaL_optnumber(L: *State, arg: int, def: Number) -> Number
+extern luaL_checkinteger(L: *State, arg: int) -> Integer
+extern luaL_optinteger(L: *State, arg: int, def: Integer) -> Integer
+extern luaL_checkstack(L: *State, sz: int, msg: *u8)
+extern luaL_checktype(L: *State, arg: int, t: int)
+extern luaL_checkany(L: *State, arg: int)
+
+extern luaL_newmetatable(L: *State, tname: *u8) -> int
+extern luaL_setmetatable(L: *State, tname: *u8)
+extern luaL_testudata(L: *State, ud: int, tname: *u8) -> *u8
+extern luaL_checkudata(L: *State, ud: int, tname: *u8) -> *u8
+
+extern luaL_where(L: *State, lvl: int)
+
+extern luaL_error(L: *State, fmt: *u8, ...) -> never
+
+extern luaL_checkoption(L: *State, arg: int, def: *u8, lst: **u8) -> int
+extern luaL_fileresult(L: *State, stat: int, fname: *u8) -> int
+extern luaL_execresult(L: *State, stat: int) -> int
+
+extern luaL_ref(L: *State, t: int) -> int
+extern luaL_unref(L: *State, t: int, ref_: int)
+
+extern luaL_loadfilex(L: *State, filename: *u8, mode: *u8) -> int
+extern luaL_loadbufferx(L: *State, buff: *u8, sz: usize, name: *u8, mode: *u8) -> int
+extern luaL_loadstring(L: *State, s: *u8) -> int
+extern luaL_newstate() -> *State
+extern luaL_len(L: *State, idx: int) -> Integer
+extern luaL_addgsub(b: *Buffer, s: *u8, p: *u8, r: *u8)
+extern luaL_gsub(L: *State, s: *u8, p: *u8, r: *u8) -> *u8
+extern luaL_setfuncs(L: *State, l: *Reg, nup: int)
+extern luaL_getsubtable(L: *State, idx: int, fname: *u8) -> int
+extern luaL_traceback(L: *State, L1: *State, msg: *u8, level: int)
+extern luaL_requiref(L: *State, modname: *u8, openf: CFunction, glb: int)
+
+extern luaL_buffinit(L: *State, B: *Buffer)
+extern luaL_prepbuffsize(B: *Buffer, sz: usize) -> *u8
+extern luaL_addlstring(B: *Buffer, s: *u8, l: usize)
+extern luaL_addstring(B: *Buffer, s: *u8)
+extern luaL_addvalue(B: *Buffer)
+extern luaL_pushresult(B: *Buffer)
+extern luaL_pushresultsize(B: *Buffer, sz: usize)
+extern luaL_buffinitsize(L: *State, B: *Buffer, sz: usize) -> *u8
+
+// ## The standard libraries (manual §6, `lualib.h`)
+
+extern luaopen_base(L: *State) -> int
+extern luaopen_coroutine(L: *State) -> int
+extern luaopen_table(L: *State) -> int
+extern luaopen_io(L: *State) -> int
+extern luaopen_os(L: *State) -> int
+extern luaopen_string(L: *State) -> int
+extern luaopen_utf8(L: *State) -> int
+extern luaopen_math(L: *State) -> int
+extern luaopen_debug(L: *State) -> int
+extern luaopen_package(L: *State) -> int
+extern luaL_openlibs(L: *State)

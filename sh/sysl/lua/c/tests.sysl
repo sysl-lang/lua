@@ -1,0 +1,897 @@
+// The C layer, checked against the header it transcribes and against a running interpreter.
+//
+// **The layout group is the one that would otherwise fail silently**: `lua_Debug`, `luaL_Buffer`,
+// `luaL_Reg` and `luaL_Stream` are laid out here by hand, and a Lua release that moved a field would
+// make every read through them wrong without making any call fail.
+
+module sh.sysl.lua.c
+@tests
+
+import sysl.raw.ptr_cast
+import sysl.buf.{Buf, buf}
+import sysl.slices.as_ptr
+import sysl.text.{from_cstring, from_utf8}
+
+// -- helpers --------------------------------------------------------------------------------------
+
+// A literal's address, for a `const char *`. **Only a literal**: it is the one `string` that is
+// NUL-terminated.
+private z(s: string) -> *u8 = as_ptr(s.bytes)
+
+
+private text_at(L: *State, idx: int) -> string
+    var len: usize = 0
+    val p = lua_tolstring(L, idx, &len)
+
+    if usize(p) == 0 then return "<not a string>"
+
+    from_utf8(p[0..<len]).unwrap()
+
+private cstr(p: *u8) -> string = if usize(p) == 0 then "<null>" else from_cstring(p).unwrap()
+
+// Runs `src` and leaves its first result on the stack.
+private eval(L: *State, src: string) -> int
+    val status = luaL_loadbufferx(L, as_ptr(src.bytes), src.bytes.len, z("=t"), null)
+
+    if status != LUA_OK then return status
+
+    lua_pcall(L, 0, 1, 0)
+
+// Evaluates an expression and leaves its value on the stack.
+private value(L: *State, expr: string) -> int = eval(L, s"return ${expr}")
+
+private fresh() -> *State
+    val L = luaL_newstate()
+
+    luaL_openlibs(L)
+
+    L
+
+// -- the ABI --------------------------------------------------------------------------------------
+
+@test("the number types are the ones luaconf.h configured")
+number_types()
+    assert_eq(NUMBER_SIZE, 8, "lua_Number is a double")
+    assert_eq(INTEGER_SIZE, 8, "lua_Integer is 64 bits")
+    assert_eq(UNSIGNED_SIZE, 8, "lua_Unsigned is 64 bits")
+    assert_eq(KCONTEXT_SIZE, sizeof(KContext), "lua_KContext is pointer-sized")
+    assert_eq(INTEGER_MAX, 9223372036854775807, "LUA_MAXINTEGER")
+
+@test("lua_Debug is laid out as the header lays it out")
+debug_layout()
+    assert_eq(sizeof(Debug), DEBUG_SIZE, "sizeof(lua_Debug)")
+    assert_eq(offsetof(Debug, name), DEBUG_NAME, "name")
+    assert_eq(offsetof(Debug, srclen), DEBUG_SRCLEN, "srclen")
+    assert_eq(offsetof(Debug, currentline), DEBUG_CURRENTLINE, "currentline")
+    assert_eq(offsetof(Debug, nups), DEBUG_NUPS, "nups")
+    assert_eq(offsetof(Debug, ftransfer), DEBUG_FTRANSFER, "ftransfer")
+    assert_eq(offsetof(Debug, short_src), DEBUG_SHORT_SRC, "short_src")
+    assert_eq(offsetof(Debug, i_ci), DEBUG_I_CI, "the private i_ci")
+
+@test("luaL_Buffer, luaL_Reg and luaL_Stream are the header's sizes")
+aux_layout()
+    assert_eq(sizeof(Buffer), BUFFER_SIZE, "sizeof(luaL_Buffer)")
+    assert_eq(offsetof(Buffer, init), BUFFER_INIT, "the inline area follows the four words")
+    assert_eq(sizeof(Reg), REG_SIZE, "sizeof(luaL_Reg)")
+    assert_eq(sizeof(Stream), STREAM_SIZE, "sizeof(luaL_Stream)")
+
+@test("the version is 5.4")
+version()
+    assert_eq(LUA_VERSION_NUM, 504, "LUA_VERSION_NUM")
+    assert_eq(LUA_VERSION_RELEASE_NUM, 50409, "the vendored release")
+
+    val L = luaL_newstate()
+
+    assert_eq(lua_version(L), 504.0, "lua_version answers the running core's")
+    luaL_checkversion(L)
+    lua_close(L)
+
+@test("the registry's predefined slots and the extra space")
+registry()
+    val L = fresh()
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_GLOBALS)
+    lua_pushglobaltable(L)
+    assert(lua_rawequal(L, -1, -2) != 0, "LUA_RIDX_GLOBALS is the global table")
+    lua_pop(L, 2)
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD)
+    assert(lua_tothread(L, -1) == L, "LUA_RIDX_MAINTHREAD is the main thread")
+    lua_pop(L, 1)
+
+    assert_eq(usize(L) - usize(lua_getextraspace(L)), LUA_EXTRASPACE, "the extra space sits just below the state")
+    assert_eq(lua_upvalueindex(1), LUA_REGISTRYINDEX - 1, "upvalue pseudo-indices are below the registry's")
+    lua_close(L)
+
+@test("the transcribed library names are the ones Lua registers")
+library_names()
+    val L = fresh()
+
+    lua_getfield(L, LUA_REGISTRYINDEX, z(LUA_LOADED_TABLE))
+    assert(lua_istable(L, -1), "_LOADED is in the registry")
+
+    for name in [LUA_GNAME, LUA_COLIBNAME, LUA_TABLIBNAME, LUA_IOLIBNAME, LUA_OSLIBNAME, LUA_STRLIBNAME, LUA_UTF8LIBNAME, LUA_MATHLIBNAME, LUA_DBLIBNAME, LUA_LOADLIBNAME]
+        assert_eq(lua_getfield(L, -1, z(name)), LUA_TTABLE, name)
+        lua_pop(L, 1)
+
+    lua_pop(L, 1)
+    lua_getfield(L, LUA_REGISTRYINDEX, z(LUA_PRELOAD_TABLE))
+    assert(lua_istable(L, -1), "_PRELOAD is in the registry")
+    lua_pop(L, 1)
+    assert(luaL_getmetatable(L, z(LUA_FILEHANDLE)) == LUA_TTABLE, "FILE* is the io library's metatable")
+    lua_close(L)
+
+// -- the stack ------------------------------------------------------------------------------------
+
+@test("the stack manipulation functions move what the manual says they move")
+stack()
+    val L = luaL_newstate()
+
+    for i in 1..5 do lua_pushinteger(L, i)
+
+    assert_eq(lua_gettop(L), 5, "five pushed")
+    assert_eq(lua_absindex(L, -1), 5, "-1 is the top")
+
+    lua_rotate(L, 2, 1)
+    assert_eq(lua_tointeger(L, 2), 5, "rotate by one moves the top down to 2")
+
+    lua_insert(L, 1)
+    assert_eq(lua_tointeger(L, 1), 4, "insert moves the top to 1")
+
+    lua_remove(L, 1)
+    assert_eq(lua_tointeger(L, 1), 1, "remove closes the gap")
+    assert_eq(lua_gettop(L), 4, "and shrinks the stack")
+
+    lua_pushinteger(L, 99)
+    lua_replace(L, 1)
+    assert_eq(lua_tointeger(L, 1), 99, "replace pops into the slot")
+
+    lua_copy(L, 1, 2)
+    assert_eq(lua_tointeger(L, 2), 99, "copy overwrites")
+
+    lua_pushvalue(L, 3)
+    assert_eq(lua_tointeger(L, -1), lua_tointeger(L, 3), "pushvalue duplicates")
+
+    lua_settop(L, 2)
+    assert_eq(lua_gettop(L), 2, "settop truncates")
+    lua_pop(L, 2)
+    assert_eq(lua_gettop(L), 0, "pop empties")
+    assert(lua_checkstack(L, 1000) != 0, "checkstack grows the stack")
+    lua_close(L)
+
+@test("access functions report types and convert as the manual says")
+access()
+    val L = luaL_newstate()
+
+    lua_pushinteger(L, 7)
+    lua_pushnumber(L, 2.5)
+    lua_pushstring(L, z("12"))
+    lua_pushboolean(L, 0)
+    lua_pushnil(L)
+    lua_pushlightuserdata(L, ptr_cast(L))
+
+    assert_eq(lua_type(L, 1), LUA_TNUMBER, "an integer is a number")
+    assert(lua_isinteger(L, 1) != 0 && lua_isinteger(L, 2) == 0, "isinteger tells them apart")
+    assert(lua_isnumber(L, 3) != 0, "a numeric string is a number to isnumber")
+    assert(lua_isstring(L, 1) != 0, "and a number is a string to isstring")
+    assert(lua_isboolean(L, 4) && lua_isnil(L, 5) && lua_islightuserdata(L, 6), "the macros")
+    assert(lua_isnone(L, 10) && lua_isnoneornil(L, 5), "past the top is none")
+    assert_eq(lua_type(L, 10), LUA_TNONE, "LUA_TNONE")
+    assert_eq(cstr(lua_typename(L, LUA_TLIGHTUSERDATA)), "userdata", "typename names the basic type")
+    assert_eq(cstr(luaL_typename(L, 2)), "number", "luaL_typename reads it off the stack")
+
+    var ok: int = 0
+
+    assert_eq(lua_tointegerx(L, 3, &ok), 12, "a string converts to an integer")
+    assert(ok != 0, "and says so")
+    lua_tointegerx(L, 2, &ok)
+    assert(ok == 0, "2.5 has no integer form")
+    assert_eq(lua_tonumberx(L, 2, &ok), 2.5, "tonumberx")
+    assert_eq(lua_tonumber(L, 1), 7.0, "tonumber")
+    assert_eq(lua_toboolean(L, 4), 0, "false")
+    assert_eq(lua_toboolean(L, 1), 1, "a number is true")
+    assert(lua_touserdata(L, 6) == ptr_cast(L), "a light userdata hands its pointer back")
+    assert(lua_topointer(L, 6) == ptr_cast(L), "and topointer agrees")
+
+    var len: usize = 0
+    lua_tolstring(L, 1, &len)
+    assert_eq(len, 1, "tolstring measures")
+    assert_eq(lua_type(L, 1), LUA_TSTRING, "and converts the number in place")
+    assert_eq(cstr(lua_tostring(L, 2)), "2.5", "tostring")
+    assert_eq(lua_rawlen(L, 3), 2, "rawlen of a string")
+    lua_close(L)
+
+@test("arithmetic, comparison and concatenation")
+operators()
+    val L = luaL_newstate()
+
+    lua_pushinteger(L, 7)
+    lua_pushinteger(L, 2)
+    lua_arith(L, LUA_OPIDIV)
+    assert_eq(lua_tointeger(L, -1), 3, "floor division")
+    lua_pushinteger(L, 4)
+    lua_arith(L, LUA_OPSHL)
+    assert_eq(lua_tointeger(L, -1), 48, "shift left")
+    lua_arith(L, LUA_OPUNM)
+    assert_eq(lua_tointeger(L, -1), -48, "unary minus takes one operand")
+    lua_pushnumber(L, 2.0)
+    lua_arith(L, LUA_OPPOW)
+    assert_eq(lua_tonumber(L, -1), 2304.0, "power is a float")
+
+    lua_pushinteger(L, 1)
+    lua_pushnumber(L, 1.0)
+    assert(lua_compare(L, -1, -2, LUA_OPEQ) != 0, "1 == 1.0")
+    assert(lua_compare(L, -1, -2, LUA_OPLT) == 0, "not less")
+    assert(lua_compare(L, -1, -2, LUA_OPLE) != 0, "but less or equal")
+    assert(lua_rawequal(L, -1, -2) != 0, "rawequal agrees")
+
+    lua_settop(L, 0)
+    lua_pushstring(L, z("a"))
+    lua_pushinteger(L, 1)
+    lua_pushstring(L, z("b"))
+    lua_concat(L, 3)
+    assert_eq(text_at(L, -1), "a1b", "concat joins and converts")
+    lua_len(L, -1)
+    assert_eq(lua_tointeger(L, -1), 3, "len pushes the length")
+
+    assert_eq(lua_stringtonumber(L, z("0x10")), 5, "stringtonumber answers the size with the terminator")
+    assert_eq(lua_tointeger(L, -1), 16, "and pushes the number")
+    assert_eq(lua_stringtonumber(L, z("nope")), 0, "and 0 for a string that is not one")
+    lua_close(L)
+
+// -- tables ---------------------------------------------------------------------------------------
+
+@test("tables are written and read by every route")
+tables()
+    val L = luaL_newstate()
+    var key: u8 = 0
+
+    lua_createtable(L, 2, 1)
+    lua_pushstring(L, z("v"))
+    lua_setfield(L, 1, z("k"))
+    lua_pushinteger(L, 10)
+    lua_seti(L, 1, 1)
+    lua_pushinteger(L, 20)
+    lua_rawseti(L, 1, 2)
+    lua_pushstring(L, z("rk"))
+    lua_pushstring(L, z("rv"))
+    lua_rawset(L, 1)
+    lua_pushstring(L, z("pv"))
+    lua_rawsetp(L, 1, &key)
+    lua_pushstring(L, z("t"))
+    lua_pushboolean(L, 1)
+    lua_settable(L, 1)
+
+    assert_eq(lua_getfield(L, 1, z("k")), LUA_TSTRING, "getfield answers the type")
+    assert_eq(text_at(L, -1), "v", "setfield/getfield")
+    assert_eq(lua_geti(L, 1, 1), LUA_TNUMBER, "geti")
+    assert_eq(lua_tointeger(L, -1), 10, "seti/geti")
+    lua_rawgeti(L, 1, 2)
+    assert_eq(lua_tointeger(L, -1), 20, "rawseti/rawgeti")
+    lua_pushstring(L, z("rk"))
+    lua_rawget(L, 1)
+    assert_eq(text_at(L, -1), "rv", "rawset/rawget")
+    lua_rawgetp(L, 1, &key)
+    assert_eq(text_at(L, -1), "pv", "rawsetp/rawgetp key on an address")
+    lua_pushstring(L, z("t"))
+    lua_gettable(L, 1)
+    assert(lua_toboolean(L, -1) != 0, "settable/gettable")
+    lua_settop(L, 1)
+
+    assert_eq(lua_rawlen(L, 1), 2, "rawlen is the border")
+    assert_eq(luaL_len(L, 1), 2, "luaL_len agrees")
+
+    var n = 0
+
+    lua_pushnil(L)
+    while lua_next(L, 1) != 0
+        n += 1
+        lua_pop(L, 1)
+
+    assert_eq(n, 6, "next visits every entry")
+
+    lua_pushvalue(L, 1)
+    lua_setglobal(L, z("g"))
+    assert_eq(lua_getglobal(L, z("g")), LUA_TTABLE, "setglobal/getglobal")
+    assert(lua_rawequal(L, 1, -1) != 0, "the same table")
+
+    assert_eq(luaL_getsubtable(L, 1, z("sub")), 0, "getsubtable makes a missing one")
+    assert_eq(luaL_getsubtable(L, 1, z("sub")), 1, "and finds it the second time")
+    lua_close(L)
+
+@test("the manual's lua_call example, in C's own terms")
+manual_call()
+    // Manual §4.6, lua_call, call for call.
+    val L = fresh()
+
+    assert_eq(eval(L, "function f(...) return table.concat({...}, ' ') end  t = {x = 'are'}"), LUA_OK, "set-up")
+    lua_settop(L, 0)
+
+    lua_getglobal(L, z("f"))
+    lua_pushstring(L, z("how"))
+    lua_getglobal(L, z("t"))
+    lua_getfield(L, -1, z("x"))
+    lua_remove(L, -2)
+    lua_pushinteger(L, 14)
+    lua_call(L, 3, 1)
+    lua_setglobal(L, z("a"))
+
+    lua_getglobal(L, z("a"))
+    assert_eq(text_at(L, -1), "how are 14", "a = f(\"how\", t.x, 14)")
+    assert_eq(lua_gettop(L), 1, "the stack is back to normal")
+    lua_close(L)
+
+// -- C functions ----------------------------------------------------------------------------------
+
+private add(L: *State) -> int
+    lua_pushinteger(L, luaL_checkinteger(L, 1) + luaL_optinteger(L, 2, 100))
+
+    1
+
+private counter(L: *State) -> int
+    val n = lua_tointeger(L, lua_upvalueindex(1)) + 1
+
+    lua_pushinteger(L, n)
+    lua_copy(L, -1, lua_upvalueindex(1))
+
+    1
+
+private raiser(L: *State) -> int
+    lua_pushstring(L, z("raised"))
+    lua_error(L)
+
+private formatted(L: *State) -> int
+    luaL_error(L, z("%s=%d"), z("answer"), 42)
+
+private choose(L: *State) -> int
+    var names: [3]*u8 = [z("left"), z("right"), null]
+
+    lua_pushinteger(L, luaL_checkoption(L, 1, z("right"), &names[0]))
+
+    1
+
+private strings(L: *State) -> int
+    var len: usize = 0
+    val s = luaL_checklstring(L, 1, &len)
+    val d = luaL_optlstring(L, 2, z("dflt"), null)
+
+    luaL_checktype(L, 3, LUA_TTABLE)
+    luaL_checkany(L, 3)
+    luaL_checkstack(L, 10, z("room"))
+    lua_pushfstring(L, z("%s/%d/%s/%f"), s, int(len), d, luaL_checknumber(L, 4) + luaL_optnumber(L, 5, 0.5))
+
+    1
+
+private bad_arg(L: *State) -> int
+    luaL_argerror(L, 2, z("custom complaint"))
+
+private bad_type(L: *State) -> int
+    luaL_typeerror(L, 1, z("widget"))
+
+@test("C functions are registered, called and raise as the manual says")
+c_functions()
+    val L = fresh()
+
+    lua_register(L, z("add"), &add)
+    lua_pushinteger(L, 0)
+    lua_pushcclosure(L, &counter, 1)
+    lua_setglobal(L, z("counter"))
+    lua_pushcfunction(L, &raiser)
+    lua_setglobal(L, z("raiser"))
+    lua_pushcfunction(L, &formatted)
+    lua_setglobal(L, z("formatted"))
+    lua_pushcfunction(L, &choose)
+    lua_setglobal(L, z("choose"))
+    lua_pushcfunction(L, &strings)
+    lua_setglobal(L, z("strings"))
+    lua_pushcfunction(L, &bad_arg)
+    lua_setglobal(L, z("bad_arg"))
+    lua_pushcfunction(L, &bad_type)
+    lua_setglobal(L, z("bad_type"))
+
+    value(L, "add(2, 3)")
+    assert_eq(lua_tointeger(L, -1), 5, "luaL_checkinteger and luaL_optinteger")
+    value(L, "add(2)")
+    assert_eq(lua_tointeger(L, -1), 102, "the default")
+    eval(L, "counter() counter() return counter()")
+    assert_eq(lua_tointeger(L, -1), 3, "an upvalue persists between calls")
+
+    value(L, "select(2, pcall(raiser))")
+    assert_eq(text_at(L, -1), "raised", "lua_error raises the top")
+    value(L, "select(2, pcall(formatted))")
+    assert_eq(text_at(L, -1), "answer=42", "luaL_error formats, with no position for a C caller")
+    value(L, "select(2, pcall(add, 'x'))")
+    assert_eq(text_at(L, -1), "bad argument #1 to 'add' (number expected, got string)", "luaL_checkinteger's message")
+    value(L, "select(2, pcall(bad_arg, 1, 2))")
+    assert_eq(text_at(L, -1), "bad argument #2 to 'bad_arg' (custom complaint)", "luaL_argerror")
+    value(L, "select(2, pcall(bad_type, true))")
+    assert_eq(text_at(L, -1), "bad argument #1 to 'bad_type' (widget expected, got boolean)", "luaL_typeerror")
+
+    value(L, "choose('left')")
+    assert_eq(lua_tointeger(L, -1), 0, "checkoption answers the index")
+    value(L, "choose()")
+    assert_eq(lua_tointeger(L, -1), 1, "and the default's")
+    value(L, "select(2, pcall(choose, 'up'))")
+    assert_eq(text_at(L, -1), "bad argument #1 to 'choose' (invalid option 'up')", "and refuses the rest")
+
+    value(L, "strings('abc', nil, {}, 1)")
+    assert_eq(text_at(L, -1), "abc/3/dflt/1.5", "checklstring, optlstring, checknumber, optnumber, pushfstring")
+    value(L, "select(2, pcall(strings, 'abc', nil, 1, 1))")
+    assert_eq(text_at(L, -1), "bad argument #3 to 'strings' (table expected, got number)", "checktype")
+
+    lua_getglobal(L, z("add"))
+    assert(lua_iscfunction(L, -1) != 0, "iscfunction")
+    assert(lua_tocfunction(L, -1) == &add, "tocfunction hands the pointer back")
+    lua_close(L)
+
+private lib_one(L: *State) -> int
+    lua_pushinteger(L, 1)
+
+    1
+
+private lib_two(L: *State) -> int
+    lua_pushinteger(L, lua_tointeger(L, lua_upvalueindex(1)) * 2)
+
+    1
+
+private open_mylib(L: *State) -> int
+    var fns: [3]Reg = [Reg(z("one"), &lib_one), Reg(z("two"), &lib_two), Reg(null, null)]
+
+    // luaL_newlib, written out: the count is the array's less its terminator.
+    lua_createtable(L, 0, 2)
+    lua_pushinteger(L, 21)
+    luaL_setfuncs(L, &fns[0], 1)
+
+    1
+
+@test("luaL_setfuncs and luaL_requiref make a library")
+libraries()
+    val L = fresh()
+
+    luaL_requiref(L, z("mylib"), &open_mylib, 1)
+    lua_pop(L, 1)
+
+    value(L, "mylib.one() + mylib.two()")
+    assert_eq(lua_tointeger(L, -1), 43, "each function, sharing the upvalue")
+    value(L, "require('mylib') == mylib")
+    assert(lua_toboolean(L, -1) != 0, "requiref registered it in package.loaded")
+    lua_close(L)
+
+// -- userdata, metatables, references -------------------------------------------------------------
+
+@test("userdata with a metatable is checked by name")
+userdata()
+    val L = fresh()
+
+    assert(luaL_newmetatable(L, z("Point")) != 0, "a new metatable")
+    assert(luaL_newmetatable(L, z("Point")) == 0, "an existing one is not remade")
+    lua_settop(L, 0)
+
+    val p: *i64 = ptr_cast(lua_newuserdatauv(L, 16, 2))
+
+    p[0] = 3
+    p[1] = 4
+    luaL_setmetatable(L, z("Point"))
+
+    lua_pushstring(L, z("first"))
+    assert(lua_setiuservalue(L, 1, 1) != 0, "a user value in range")
+    lua_pushstring(L, z("third"))
+    assert(lua_setiuservalue(L, 1, 3) == 0, "and out of range")
+    assert_eq(lua_getiuservalue(L, 1, 1), LUA_TSTRING, "read back")
+    assert_eq(text_at(L, -1), "first", "the value")
+    lua_pop(L, 1)
+
+    assert(lua_isuserdata(L, 1) != 0, "isuserdata")
+    assert_eq(lua_rawlen(L, 1), 16, "rawlen is the block's size")
+
+    val back: *i64 = ptr_cast(luaL_checkudata(L, 1, z("Point")))
+    assert_eq(back[1], 4, "checkudata hands the block back")
+    assert(usize(luaL_testudata(L, 1, z("Other"))) == 0, "testudata refuses another name")
+
+    assert(lua_getmetatable(L, 1) != 0, "getmetatable")
+    lua_pushstring(L, z("Point"))
+    lua_setfield(L, -2, z("__name"))
+    lua_pop(L, 1)
+    assert(luaL_getmetafield(L, 1, z("__name")) == LUA_TSTRING, "getmetafield")
+    lua_pop(L, 1)
+    luaL_tolstring(L, 1, null)
+    assert(text_at(L, -1).starts_with("Point: "), "luaL_tolstring uses __name")
+    lua_pop(L, 1)
+
+    lua_newtable(L)
+    lua_setmetatable(L, 1)
+    assert(luaL_callmeta(L, 1, z("__tostring")) == 0, "callmeta with no such field")
+
+    val u: *u8 = lua_newuserdata(L, 8)
+    lua_pushinteger(L, 5)
+    lua_setuservalue(L, -2)
+    lua_getuservalue(L, -1)
+    assert_eq(lua_tointeger(L, -1), 5, "the one-user-value macros")
+    assert(usize(u) != 0, "newuserdata")
+    lua_close(L)
+
+@test("references are slots that come back")
+references()
+    val L = luaL_newstate()
+
+    lua_newtable(L)
+    lua_pushstring(L, z("held"))
+    val r = luaL_ref(L, 1)
+
+    assert(r > 0, "a reference")
+    lua_rawgeti(L, 1, r)
+    assert_eq(text_at(L, -1), "held", "reads back")
+    lua_pop(L, 1)
+
+    lua_pushnil(L)
+    assert_eq(luaL_ref(L, 1), LUA_REFNIL, "nil is LUA_REFNIL")
+
+    luaL_unref(L, 1, r)
+    lua_pushstring(L, z("again"))
+    assert_eq(luaL_ref(L, 1), r, "a freed slot is reused")
+    luaL_unref(L, 1, LUA_NOREF)
+    lua_close(L)
+
+// -- the buffer -----------------------------------------------------------------------------------
+
+@test("luaL_Buffer builds a string piecewise, past its inline size")
+buffers()
+    val L = luaL_newstate()
+    var b: Buffer = Buffer(null, 0, 0, null, [0; BUFFER_INIT_WORDS])
+
+    luaL_buffinit(L, &b)
+    luaL_addlstring(&b, z("abcdef"), 3)
+    luaL_addstring(&b, z("-"))
+    luaL_addchar(&b, u8('x'))
+    lua_pushinteger(L, 7)
+    luaL_addvalue(&b)
+    assert_eq(luaL_bufflen(&b), 6, "bufflen")
+
+    for i in 0..<2000 do luaL_addchar(&b, u8('.'))
+
+    luaL_pushresult(&b)
+    var len: usize = 0
+    val p = lua_tolstring(L, -1, &len)
+
+    assert_eq(len, 2006, "it grew past LUAL_BUFFERSIZE")
+    assert_eq(from_utf8(p[0..<6]).unwrap(), "abc-x7", "every piece in order")
+    lua_pop(L, 1)
+
+    var c: Buffer = Buffer(null, 0, 0, null, [0; BUFFER_INIT_WORDS])
+    val area = luaL_buffinitsize(L, &c, 4)
+
+    area[0] = u8('w')
+    area[1] = u8('x')
+    luaL_pushresultsize(&c, 2)
+    assert_eq(text_at(L, -1), "wx", "buffinitsize/pushresultsize")
+    lua_pop(L, 1)
+
+    var d: Buffer = Buffer(null, 0, 0, null, [0; BUFFER_INIT_WORDS])
+    luaL_buffinit(L, &d)
+    val q = luaL_prepbuffer(&d)
+    q[0] = u8('z')
+    luaL_addsize(&d, 1)
+    luaL_addchar(&d, u8('!'))
+    luaL_buffsub(&d, 1)
+    luaL_addgsub(&d, z("a.b"), z("."), z("::"))
+    luaL_pushresult(&d)
+    assert_eq(text_at(L, -1), "za::b", "prepbuffer, addsize, buffsub, addgsub")
+
+    assert_eq(cstr(luaL_gsub(L, z("x-y-z"), z("-"), z("+"))), "x+y+z", "luaL_gsub")
+    lua_close(L)
+
+// -- load, dump, readers and writers --------------------------------------------------------------
+
+private struct Source
+    data: *u8
+    len: usize
+    given: bool
+
+private read_chunk(L: *State, ud: *u8, size: *usize) -> *u8
+    val s: *Source = ptr_cast(ud)
+
+    if (*s).given
+        *size = 0
+
+        return null
+    end if
+
+    (*s).given = true
+    *size = (*s).len
+
+    (*s).data
+
+private write_chunk(L: *State, p: *u8, sz: usize, ud: *u8) -> int
+    val out: *Buf[u8] = ptr_cast(ud)
+
+    for i in 0..<sz do (*out).push(p[i])
+
+    0
+
+@test("a chunk is loaded through a reader, dumped through a writer, and loaded back as binary")
+load_dump()
+    val L = fresh()
+    val src = "local a, b = ... return a * b"
+    var source = Source(as_ptr(src.bytes), src.bytes.len, false)
+
+    assert_eq(lua_load(L, &read_chunk, ptr_cast(&source), z("=reader"), null), LUA_OK, "lua_load")
+
+    var bytes: Buf[u8] = buf()
+
+    assert_eq(lua_dump(L, &write_chunk, ptr_cast(&bytes), 1), 0, "lua_dump")
+    assert(bytes.len() > 4 && bytes[0] == 27 && bytes[1] == u8('L'), "a binary chunk begins with LUA_SIGNATURE")
+    lua_pop(L, 1)
+
+    val view = bytes.view()
+    var binary = Source(as_ptr(view), view.len, false)
+
+    assert_eq(lua_load(L, &read_chunk, ptr_cast(&binary), z("=bin"), z("b")), LUA_OK, "the binary loads in mode b")
+    lua_pushinteger(L, 6)
+    lua_pushinteger(L, 7)
+    assert_eq(lua_pcall(L, 2, 1, 0), LUA_OK, "and runs")
+    assert_eq(lua_tointeger(L, -1), 42, "with the same meaning")
+    lua_pop(L, 1)
+
+    var text_again = Source(as_ptr(src.bytes), src.bytes.len, false)
+
+    assert_eq(lua_load(L, &read_chunk, ptr_cast(&text_again), z("=t"), z("b")), LUA_ERRSYNTAX, "a text chunk is refused in mode b")
+    assert(text_at(L, -1).contains("attempt to load a text chunk"), "saying why")
+    lua_pop(L, 1)
+
+    assert_eq(luaL_loadstring(L, z("return 1 +")), LUA_ERRSYNTAX, "loadstring reports a syntax error")
+    lua_pop(L, 1)
+    assert(!luaL_dostring(L, z("x = 5")), "dostring answers false on success")
+    assert(luaL_dostring(L, z("error('e')")), "and true on failure")
+    lua_pop(L, 1)
+    assert_eq(luaL_loadbuffer(L, z("return 2"), 8, z("=b")), LUA_OK, "loadbuffer")
+    lua_pop(L, 1)
+    assert_eq(luaL_loadfile(L, z("testdata/greeting.lua")), LUA_OK, "loadfile")
+    lua_pop(L, 1)
+    assert(!luaL_dofile(L, z("testdata/greeting.lua")), "dofile")
+    assert_eq(luaL_loadfilex(L, z("testdata/none.lua"), null), LUA_ERRFILE, "a missing file is LUA_ERRFILE")
+    lua_close(L)
+
+// -- errors, tracebacks ---------------------------------------------------------------------------
+
+private traceback_handler(L: *State) -> int
+    luaL_traceback(L, L, lua_tostring(L, 1), 1)
+
+    1
+
+@test("pcall with a message handler, and luaL_traceback")
+tracebacks()
+    val L = fresh()
+
+    eval(L, "function inner() error('deep') end  function outer() inner() end")
+    lua_settop(L, 0)
+
+    lua_pushcfunction(L, &traceback_handler)
+    lua_getglobal(L, z("outer"))
+    assert_eq(lua_pcall(L, 0, 0, 1), LUA_ERRRUN, "a runtime error")
+
+    val tb = text_at(L, -1)
+
+    assert(tb.starts_with("t:1: deep\nstack traceback:"), "message then traceback")
+    assert(tb.contains("in function 'inner'"), "naming the raiser")
+    lua_settop(L, 0)
+
+    lua_pushcfunction(L, &raiser)
+    assert_eq(lua_pcallk(L, 0, 0, 0, 0, null), LUA_ERRRUN, "lua_pcallk")
+    lua_settop(L, 0)
+
+    luaL_where(L, 1)
+    assert_eq(text_at(L, -1), "", "where at level 1 from C is empty")
+    lua_close(L)
+
+// -- coroutines -----------------------------------------------------------------------------------
+
+@test("a thread is resumed, yields, and is closed")
+threads()
+    val L = fresh()
+    val co = lua_newthread(L)
+
+    eval(co, "return function(a) local b = coroutine.yield(a + 1) return b * 2 end")
+    var nres: int = 0
+
+    lua_pushinteger(co, 10)
+    assert_eq(lua_resume(co, L, 1, &nres), LUA_YIELD, "it yields")
+    assert_eq(nres, 1, "one value")
+    assert_eq(lua_tointeger(co, -1), 11, "the value yielded")
+    assert_eq(lua_status(co), LUA_YIELD, "status while suspended")
+    lua_pop(co, nres)
+
+    lua_pushinteger(co, 4)
+    assert_eq(lua_resume(co, L, 1, &nres), LUA_OK, "it finishes")
+    assert_eq(lua_tointeger(co, -1), 8, "with its return value")
+
+    lua_xmove(co, L, 1)
+    assert_eq(lua_tointeger(L, -1), 8, "xmove carries a value between threads")
+    assert(lua_isyieldable(L) == 0, "the main thread cannot yield")
+    lua_pushthread(L)
+    assert(lua_isthread(L, -1), "pushthread")
+    assert_eq(lua_closethread(co, L), LUA_OK, "closethread")
+    assert_eq(lua_resetthread(co), LUA_OK, "and the deprecated resetthread")
+    lua_close(L)
+
+// -- the debug interface --------------------------------------------------------------------------
+
+private where_am_i(L: *State) -> int
+    var ar = Debug(0, null, null, null, null, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, [0; IDSIZE], null)
+
+    if lua_getstack(L, 1, &ar) == 0 then return 0
+
+    lua_getinfo(L, z("nSl"), &ar)
+    lua_pushfstring(L, z("%s:%d:%s"), &ar.short_src[0], ar.currentline, ar.what)
+
+    1
+
+private var hook_calls = 0
+
+private on_line(L: *State, ar: *Debug)
+    hook_calls += 1
+
+@test("getstack and getinfo fill lua_Debug's fields")
+debug_info()
+    val L = fresh()
+
+    lua_register(L, z("where_am_i"), &where_am_i)
+    eval(L, "local x = 1\nreturn where_am_i()")
+    assert_eq(text_at(L, -1), "t:2:main", "short_src, currentline and what")
+    lua_settop(L, 0)
+
+    var ar = Debug(0, null, null, null, null, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, [0; IDSIZE], null)
+
+    eval(L, "local up = 5 return function(a, b, ...) return up + a end")
+    lua_pushvalue(L, -1)
+    lua_getinfo(L, z(">Su"), &ar)
+    assert_eq(ar.nparams, 2, "nparams")
+    assert_eq(ar.isvararg, 1, "isvararg")
+    assert_eq(ar.nups, 1, "nups")
+    assert_eq(ar.linedefined, 1, "linedefined")
+    assert_eq(cstr(ar.what), "Lua", "what")
+
+    assert_eq(cstr(lua_getupvalue(L, 1, 1)), "up", "getupvalue names it")
+    assert_eq(lua_tointeger(L, -1), 5, "and pushes it")
+    lua_pop(L, 1)
+    lua_pushinteger(L, 37)
+    assert_eq(cstr(lua_setupvalue(L, 1, 1)), "up", "setupvalue")
+    lua_pushvalue(L, 1)
+    lua_pushinteger(L, 5)
+    lua_call(L, 1, 1)
+    assert_eq(lua_tointeger(L, -1), 42, "the function sees the new upvalue")
+    lua_pop(L, 1)
+    assert(usize(lua_upvalueid(L, 1, 1)) != 0, "upvalueid")
+
+    eval(L, "local other = 0 return function() return other end")
+    lua_upvaluejoin(L, 2, 1, 1, 1)
+    lua_call(L, 0, 1)
+    assert_eq(lua_tointeger(L, -1), 37, "upvaluejoin shares the first function's upvalue")
+    lua_close(L)
+
+@test("a line hook fires, and gethook reports it")
+hooks()
+    val L = fresh()
+
+    lua_sethook(L, &on_line, LUA_MASKLINE, 0)
+    assert(lua_gethook(L) == &on_line, "gethook")
+    assert_eq(lua_gethookmask(L), LUA_MASKLINE, "gethookmask")
+    assert_eq(lua_gethookcount(L), 0, "gethookcount")
+
+    eval(L, "local a = 1\nlocal b = 2\nlocal c = 3")
+    assert(hook_calls >= 3, "one call per line")
+
+    lua_sethook(L, null, 0, 0)
+    assert_eq(lua_gethookmask(L), 0, "and it is removed")
+    assert(lua_setcstacklimit(L, 200) >= 0, "setcstacklimit is accepted (a no-op since 5.4.3)")
+    lua_close(L)
+
+// -- the collector, allocator, warnings, panic -----------------------------------------------------
+
+@test("lua_gc's options, through the variadic call")
+gc()
+    val L = fresh()
+
+    eval(L, "junk = {} for i = 1, 10000 do junk[i] = {} end junk = nil")
+    val before = lua_gc(L, LUA_GCCOUNT)
+
+    lua_gc(L, LUA_GCCOLLECT)
+    assert(lua_gc(L, LUA_GCCOUNT) < before, "a full collection frees the garbage")
+    assert(lua_gc(L, LUA_GCCOUNTB) >= 0, "the remainder in bytes")
+    assert(lua_gc(L, LUA_GCISRUNNING) != 0, "the collector runs")
+    lua_gc(L, LUA_GCSTOP)
+    assert(lua_gc(L, LUA_GCISRUNNING) == 0, "until stopped")
+    lua_gc(L, LUA_GCRESTART)
+    lua_gc(L, LUA_GCSTEP, 0)
+    assert_eq(lua_gc(L, LUA_GCGEN, 0, 0), LUA_GCINC, "switching to generational answers the previous mode")
+    assert_eq(lua_gc(L, LUA_GCINC, 0, 0, 0), LUA_GCGEN, "and back")
+    lua_gc(L, LUA_GCSETPAUSE, 200)
+    lua_gc(L, LUA_GCSETSTEPMUL, 100)
+    lua_close(L)
+
+private struct Tally
+    bytes: usize
+    calls: int
+
+private counting_alloc(ud: *u8, p: *u8, osize: usize, nsize: usize) -> *u8
+    val t: *Tally = ptr_cast(ud)
+
+    (*t).calls += 1
+
+    if nsize == 0
+        if usize(p) != 0 then (*t).bytes -= osize
+        c_free(p)
+
+        return null
+    end if
+
+    val q = c_realloc(p, nsize)
+
+    (*t).bytes = (*t).bytes - (if usize(p) == 0 then 0 else osize) + nsize
+
+    q
+
+@needs(os)
+extern "realloc" c_realloc(p: *u8, n: usize) -> *u8
+
+@needs(os)
+extern "free" c_free(p: *u8)
+
+@test("a state made with a custom allocator uses it for everything")
+allocators()
+    var tally = Tally(0, 0)
+    val L = lua_newstate(&counting_alloc, ptr_cast(&tally))
+
+    assert(tally.calls > 0 && tally.bytes > 0, "the state itself was allocated through it")
+
+    var ud: *u8 = null
+
+    assert(lua_getallocf(L, &ud) == &counting_alloc, "getallocf answers it")
+    assert(ud == ptr_cast(&tally), "with its user data")
+    lua_setallocf(L, &counting_alloc, ptr_cast(&tally))
+    lua_close(L)
+    assert_eq(tally.bytes, 0, "and closing gives every byte back")
+
+private warn_into(ud: *u8, msg: *u8, tocont: int)
+    val out: *Buf[u8] = ptr_cast(ud)
+    var i: usize = 0
+
+    while msg[i] != 0
+        (*out).push(msg[i])
+        i += 1
+
+    if tocont == 0 then (*out).push(u8('|'))
+
+@test("warnings reach the warning function, pieces and all")
+warnings()
+    val L = fresh()
+    var got: Buf[u8] = buf()
+
+    lua_setwarnf(L, &warn_into, ptr_cast(&got))
+    lua_warning(L, z("one "), 1)
+    lua_warning(L, z("piece"), 0)
+    eval(L, "warn('from ', 'lua')")
+
+    assert_eq(from_utf8(got.view()).unwrap(), "one piece|from lua|", "tocont joins the pieces")
+    lua_close(L)
+
+private quiet_panic(L: *State) -> int = 0
+
+@test("atpanic swaps the panic function")
+panics()
+    val L = luaL_newstate()
+    val old = lua_atpanic(L, &quiet_panic)
+
+    assert(usize(old) != 0, "luaL_newstate installs one")
+    assert(lua_atpanic(L, old) == &quiet_panic, "and the swap answers ours")
+    lua_close(L)
+
+@test("a to-be-closed slot is closed by closeslot")
+to_be_closed()
+    val L = fresh()
+
+    eval(L, "closed = false return setmetatable({}, {__close = function() closed = true end})")
+    lua_toclose(L, -1)
+    lua_closeslot(L, -1)
+    lua_getglobal(L, z("closed"))
+    assert(lua_toboolean(L, -1) != 0, "__close ran")
+    lua_close(L)

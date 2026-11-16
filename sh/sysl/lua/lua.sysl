@@ -1,0 +1,918 @@
+// Lua for sysl — a Lua 5.4 interpreter, embedded.
+//
+// A program makes a `State`, runs source in it, and reads what comes back as `&Value`s. A `&Value`
+// holds its Lua value alive for as long as the box lives and lets it go in its destructor, so
+// nothing in a program manages Lua's stack or its registry.
+//
+//     val lua = state()?
+//
+//     lua.run("function greet(name) return 'hello, ' .. name end")?
+//     print(lua.global("greet")?.call([lua.text("sysl")])?.text()?)      // hello, sysl
+//
+// **`eval` is the interactive interpreter's rule**: the source is tried as an expression first and
+// as a chunk second, so `lua.eval("1 + 2")` answers 3 where a chunk would need a `return`.
+//
+// **A sysl closure can be a Lua function.** `define` registers one as a global, and the script calls
+// it by name. What it is handed is a `Call`, whose argument readers fail with the message Lua's own
+// library functions give:
+//
+//     val scale = 3
+//
+//     lua.define("scale", (call) -> Ok(call.state.integer(call.integer(0)? * scale)))?
+//     print(lua.eval("scale(14)")?.integer()?)                           // 42
+//
+// **An error is an `Error` here and a Lua error there.** A script that fails answers `Err` with the
+// message and a traceback; a sysl function that answers `Err` raises its message in the script,
+// where a Lua `pcall` catches it like any other.
+//
+// **What a script may do is the embedding's to choose**: `bare()` opens no libraries and `open` adds
+// them one at a time; `limit_memory` caps the bytes the interpreter may hold and `limit_steps` the
+// instructions one call from sysl may run.
+
+module sh.sysl.lua
+
+import sh.sysl.lua.c
+import sysl.buf.{Buf, buf}
+import sysl.text.{cstring, from_utf8}
+import sysl.slices.as_ptr
+import sysl.raw.ptr_cast
+
+// ## What goes wrong
+
+// Which of Lua's failures an `Error` is.
+//
+// `Type` is this package's own: a value read as something it is not — a table as an integer, a
+// string holding bytes that are not UTF-8 as text.
+enum ErrorKind
+    Runtime
+    Syntax
+    Memory
+    Handler
+    File
+    Type
+
+// **Both strings are copied out of Lua**, so an `Error` refers to nothing and outlives its state.
+// `traceback` is Lua's `stack traceback:` text where the failure happened inside a call, and empty
+// where there was no call to trace (a syntax error, a value read as the wrong type).
+struct Error
+    kind: ErrorKind
+    message: string
+    traceback: string
+
+impl Display for Error
+    display(self, out: *Writer, fmt: FormatSpec) =
+        if self.traceback == "" then self.message.display(out, fmt) else s"${self.message}\n${self.traceback}".display(out, fmt)
+
+private type_error(message: string) -> Error = Error(ErrorKind.Type, message, "")
+
+// The basic type of a value, as Lua's `type` names it.
+enum Kind
+    Nil
+    Boolean
+    LightUserdata
+    Number
+    String
+    Table
+    Function
+    Userdata
+    Thread
+
+// The standard libraries, each opened on its own by `State.open`.
+enum Library
+    Base
+    Coroutine
+    Table
+    Io
+    Os
+    String
+    Utf8
+    Math
+    Debug
+    Package
+
+// ## A state
+//
+// One Lua universe: its globals, its registry, its garbage collector. **The constructor answers a
+// `&State`**, as every type with a destructor must, and the destructor is `lua_close`.
+//
+// `natives` is what keeps every registered sysl closure alive for as long as Lua can call it; the
+// edge back from a closure to its state is weak, since a strong one would be a cycle.
+//
+// `cur` is the Lua thread currently running. It is the main thread except while a sysl function
+// called from a coroutine is running, when every value it makes or reads is made or read on the
+// coroutine's own stack — the one stack Lua allows a running function to use.
+struct State
+    private L: *c.State
+    private cur: *c.State
+    private natives: Buf[&Native]
+    private self_ref: weak State
+    private used: usize
+    private cap: usize
+    private steps: int
+    private depth: int
+
+    // ### Running source
+    //
+    // `name` is the chunk name Lua puts in front of a message: `=name` prints as `name`, and
+    // anything else as a quoted source line, which is Lua's own convention (manual §4.1).
+
+    // Runs a chunk for its effects. Its results, if it has any, are discarded.
+    run(*self, source: string, name: string = "=chunk") -> Result[unit, Error]
+        self.load(source, name)?.call_all([])?
+
+        Ok(())
+
+    // **The first value a chunk answers, trying it as an expression first.** `"1 + 2"` is not a Lua
+    // chunk but `return 1 + 2` is, and the stand-alone interpreter `lua` makes exactly this attempt
+    // with every line typed at it; where the expression does not parse, the source is run as a
+    // chunk. A chunk that answers nothing answers `nil`.
+    eval(*self, source: string, name: string = "=chunk") -> Result[&Value, Error]
+        val all = self.eval_all(source, name)?
+
+        Ok(if all.len() > 0 then all[0] else self.nil())
+
+    // Every value the source answers, under `eval`'s rule.
+    eval_all(*self, source: string, name: string = "=chunk") -> Result[Buf[&Value], Error]
+        val f = self.load(s"return ${source}", name) match
+            Ok(f) -> f
+            Err(e) -> if e.kind == ErrorKind.Syntax then self.load(source, name)? else return Err(e)
+
+        f.call_all([])
+
+    // Compiles a chunk without running it, and answers it as a function.
+    load(*self, source: string, name: string = "=chunk") -> Result[&Value, Error]
+        val label = cstring(name)
+        val status = c.luaL_loadbufferx(self.cur, as_ptr(source.bytes), source.bytes.len, label.ptr, as_ptr(TEXT_MODE.bytes))
+
+        if status != c.LUA_OK then return Err(self.failure(status))
+
+        Ok(self.adopt())
+
+    // Compiles a file. Lua reads it itself, so a missing file is an `ErrorKind.File` naming the path.
+    load_file(*self, file: string) -> Result[&Value, Error]
+        val path = cstring(file)
+        val status = c.luaL_loadfilex(self.cur, path.ptr, as_ptr(TEXT_MODE.bytes))
+
+        if status != c.LUA_OK then return Err(self.failure(status))
+
+        Ok(self.adopt())
+
+    // Runs a file for its effects.
+    run_file(*self, file: string) -> Result[unit, Error]
+        self.load_file(file)?.call_all([])?
+
+        Ok(())
+
+    // ### Globals
+
+    global(*self, name: string) -> Result[&Value, Error]
+        c.lua_pushglobaltable(self.cur)
+        self.push_text(name)
+        self.protected(&p_gettable, 2, 1)?
+
+        Ok(self.adopt())
+
+    set_global(*self, name: string, v: &Value) -> Result[unit, Error]
+        c.lua_pushglobaltable(self.cur)
+        self.push_text(name)
+        self.push(v)
+        self.protected(&p_settable, 3, 0)?
+
+        Ok(())
+
+    // ### Making values
+
+    nil(self) -> &Value
+        c.lua_pushnil(self.cur)
+        self.adopt()
+
+    boolean(self, b: bool) -> &Value
+        c.lua_pushboolean(self.cur, if b then 1 else 0)
+        self.adopt()
+
+    integer(self, n: i64) -> &Value
+        c.lua_pushinteger(self.cur, n)
+        self.adopt()
+
+    number(self, n: f64) -> &Value
+        c.lua_pushnumber(self.cur, n)
+        self.adopt()
+
+    // Copies the bytes; Lua strings are byte strings, so any `string` is one.
+    text(self, s: string) -> &Value
+        self.push_text(s)
+        self.adopt()
+
+    // An empty table.
+    table(self) -> &Value
+        c.lua_createtable(self.cur, 0, 0)
+        self.adopt()
+
+    // ### Registering a sysl function
+    //
+    // **An argument is read with `Call`'s readers, numbered from 0**, and a reader that fails says
+    // `bad argument #1 to 'name' (number expected, got string)`, as Lua's library does. A function
+    // that answers `Err` raises its message in the script.
+
+    // Makes `f` the global `name`.
+    define(*self, name: string, f: &Fn(Call) -> Result[&Value, Error]) -> Result[unit, Error] =
+        self.set_global(name, self.function(name, f))
+
+    // The same for a function answering several values, as Lua functions may.
+    define_many(*self, name: string, f: &Fn(Call) -> Result[Buf[&Value], Error]) -> Result[unit, Error] =
+        self.set_global(name, self.function_many(name, f))
+
+    // `f` as a Lua function value, for a program putting it somewhere other than a global. `name` is
+    // the one its argument errors give.
+    function(*self, name: string, f: &Fn(Call) -> Result[&Value, Error]) -> &Value =
+        self.native(Native(Body.One(f), self.self_ref, name))
+
+    function_many(*self, name: string, f: &Fn(Call) -> Result[Buf[&Value], Error]) -> &Value =
+        self.native(Native(Body.Many(f), self.self_ref, name))
+
+    private native(*self, slot: &Native) -> &Value
+        // **The upvalue is the box's address and `natives` is what keeps the box alive.** Lua hands
+        // the pointer back on every call, and nothing about a light userdata keeps its object.
+        self.natives.push(slot)
+        c.lua_pushlightuserdata(self.cur, ptr_cast(&*slot))
+        c.lua_pushcclosure(self.cur, &trampoline, 1)
+        self.adopt()
+
+    // ### Libraries
+
+    // Opens one standard library, as `require` would, and sets its global.
+    open(*self, lib: Library) -> Result[unit, Error]
+        val (name, f) = library(lib)
+
+        self.push_text(name)
+        c.lua_pushcfunction(self.cur, f)
+        self.protected(&p_require, 2, 0)?
+
+        Ok(())
+
+    // ### Limits
+    //
+    // **What an embedding sets so that a script cannot take the process with it.**
+
+    // A ceiling on the bytes the interpreter may hold; 0 is no ceiling. Past it, an allocation fails
+    // and the script sees Lua's own `not enough memory` error — an `ErrorKind.Memory` here — where a
+    // ceiling lower than what is already held refuses only what would grow it.
+    limit_memory(*self, bytes: usize) = self.cap = bytes
+
+    // The bytes the interpreter holds now.
+    memory_used(self) -> usize = self.used
+
+    // A ceiling on the virtual-machine instructions one call from sysl may run — `run`, `eval`,
+    // `call` and the rest — counted afresh at each; 0 is no ceiling. Past it the script fails with
+    // `the step limit was reached`, and **a `pcall` inside the script cannot keep it going**: once the
+    // limit is hit, every further instruction fails too, until the call from sysl has returned.
+    // Lua copies a hook into a coroutine when it is made, so a coroutine made before the limit was
+    // set is not counted.
+    limit_steps(*self, n: int)
+        self.steps = n
+
+        if n == 0 then c.lua_sethook(self.L, null, 0, 0)
+
+    // Runs a full garbage-collection cycle.
+    collect(self) = c.lua_gc(self.cur, c.LUA_GCCOLLECT)
+
+    // ### The protected call every entry into Lua goes through
+    //
+    // **The function and its `nargs` arguments are on the stack**; on success its `nresults` results
+    // are left there (all of them, for `LUA_MULTRET`) and their count is the answer. The message
+    // handler is slipped in beneath the function, so a failing call answers a traceback taken where
+    // the error was raised — the one place it still can be.
+    private[lua] protected(*self, f: c.CFunction, nargs: int, nresults: int) -> Result[int, Error]
+        c.lua_pushcfunction(self.cur, f)
+        c.lua_insert(self.cur, -nargs - 1)
+        self.call_on_stack(nargs, nresults)
+
+    private[lua] call_on_stack(*self, nargs: int, nresults: int) -> Result[int, Error]
+        val L = self.cur
+        val base = c.lua_gettop(L) - nargs
+
+        c.lua_pushcfunction(L, &handler)
+        c.lua_insert(L, base)
+
+        if self.depth == 0 && self.steps > 0 then c.lua_sethook(L, &on_count, c.LUA_MASKCOUNT, self.steps)
+
+        self.depth += 1
+        val status = c.lua_pcall(L, nargs, nresults, base)
+        self.depth -= 1
+
+        if status != c.LUA_OK
+            val e = self.failure(status)
+
+            c.lua_settop(L, base - 1)
+
+            return Err(e)
+        end if
+
+        c.lua_remove(L, base)
+
+        Ok(c.lua_gettop(L) - base + 1)
+
+    // Reads the error on top of the stack, pops it, and takes the traceback the handler left.
+    private failure(self, status: int) -> Error
+        val message = read_text(self.cur, -1) match
+            Some(s) -> s
+            None -> s"a ${type_name(self.cur, -1)} error object"
+
+        c.lua_pop(self.cur, 1)
+
+        c.lua_getfield(self.cur, c.LUA_REGISTRYINDEX, as_ptr(TRACEBACK.bytes))
+        val traceback = read_text(self.cur, -1).unwrap_or("")
+        c.lua_pop(self.cur, 1)
+
+        c.lua_pushnil(self.cur)
+        c.lua_setfield(self.cur, c.LUA_REGISTRYINDEX, as_ptr(TRACEBACK.bytes))
+
+        Error(error_kind(status), message, traceback)
+
+    // ### Between the stack and a `&Value`
+    //
+    // **Every `&Value` is one slot in the registry**, taken by `luaL_ref` and given back by its
+    // destructor; nothing a program holds lives on Lua's stack.
+
+    // Pops the top of the stack into a box.
+    private[lua] adopt(self) -> &Value = Value(c.luaL_ref(self.cur, c.LUA_REGISTRYINDEX), self.strong())
+
+    private[lua] push(self, v: &Value) = self.push_slot(v.slot)
+
+    private[lua] push_slot(self, slot: int) = c.lua_rawgeti(self.cur, c.LUA_REGISTRYINDEX, slot)
+
+    private[lua] push_text(self, s: string) = c.lua_pushlstring(self.cur, as_ptr(s.bytes), s.bytes.len)
+
+    private[lua] lua(self) -> *c.State = self.cur
+
+    private strong(self) -> &State
+        self.self_ref.get() match
+            Some(s) -> s
+            None -> panic("a state reached from its own method cannot be gone")
+
+    // ### Calling out of Lua, into sysl
+    //
+    // **While a sysl function runs, `cur` is the thread that called it**, which is put back after.
+    private[lua] invoke(*self, L: *c.State, native: *Native) -> int
+        val outer = self.cur
+
+        self.cur = L
+        val n = self.dispatch(L, native)
+        self.cur = outer
+
+        n
+
+    private dispatch(self, L: *c.State, native: *Native) -> int
+        val top = c.lua_gettop(L)
+        var args: Buf[&Value] = buf()
+
+        for i in 1..top
+            c.lua_pushvalue(L, i)
+            args.push(self.adopt())
+
+        val call = Call(self.strong(), args.view(), (*native).name)
+
+        (*native).body match
+            Body.One(f) ->
+                f(call) match
+                    Ok(v) ->
+                        self.push(v)
+                        1
+                    Err(e) -> raise(L, e)
+
+            Body.Many(f) ->
+                f(call) match
+                    Ok(vs) ->
+                        if c.lua_checkstack(L, int(vs.len())) == 0 then return raise(L, type_error("too many results to fit on Lua's stack"))
+
+                        for v in vs do self.push(v)
+
+                        int(vs.len())
+
+                    Err(e) -> raise(L, e)
+end State
+
+impl Drop for State
+    // A state whose `lua_newstate` failed has nothing to close.
+    drop(self) = if usize(self.L) != 0 then c.lua_close(self.L)
+
+// A state with every standard library open, as the stand-alone `lua` has.
+state() -> Result[&State, Error]
+    val s = bare()?
+
+    s.protected(&p_openlibs, 0, 0)?
+
+    Ok(s)
+
+// A state with no library open at all: not even `print`, `pairs` or `string`. `open` adds them.
+bare() -> Result[&State, Error]
+    var s: &State = State(null, null, buf(), None, 0, 0, 0, 0)
+
+    s.self_ref = s
+
+    // **The allocator's user data is this box's own address**, which is what lets `limit_memory`
+    // count and refuse: `allocate` reads `used` and `cap` through it.
+    val L = c.lua_newstate(&allocate, ptr_cast(&*s))
+
+    if usize(L) == 0 then return Err(Error(ErrorKind.Memory, "Lua could not make a state", ""))
+
+    s.L = L
+    s.cur = L
+
+    Ok(s)
+
+// ## A value
+//
+// **Every `&Value` owns one registry slot**, and the destructor gives it back. It keeps its state
+// alive, so a value may be read after every other name for the state has gone.
+struct Value
+    private[lua] slot: int
+    private state: &State
+
+    kind(self) -> Kind
+        self.state.push_slot(self.slot)
+        val t = c.lua_type(self.state.lua(), -1)
+        c.lua_pop(self.state.lua(), 1)
+
+        kind_of(t)
+
+    is_nil(self) -> bool = self.kind() == Kind.Nil
+
+    // **Lua's truth**: everything but `nil` and `false` is true, `0` and `""` included.
+    truthy(self) -> bool
+        self.state.push_slot(self.slot)
+        val b = c.lua_toboolean(self.state.lua(), -1) != 0
+        c.lua_pop(self.state.lua(), 1)
+
+        b
+
+    // ### Reading it as a sysl value
+    //
+    // **Lua's own conversions**: a string that reads as a number is one, and a float with an exact
+    // integer value is an integer — `"10"` and `10.0` both answer 10 here, and `10.5` fails.
+
+    integer(self) -> Result[i64, Error]
+        self.state.push_slot(self.slot)
+        val out = to_integer(self.state.lua(), -1)
+        c.lua_pop(self.state.lua(), 1)
+
+        out
+
+    number(self) -> Result[f64, Error]
+        self.state.push_slot(self.slot)
+        val out = to_number(self.state.lua(), -1)
+        c.lua_pop(self.state.lua(), 1)
+
+        out
+
+    // A string, or a number written as Lua writes it; the bytes must be UTF-8.
+    text(self) -> Result[string, Error]
+        self.state.push_slot(self.slot)
+        val out = to_text(self.state.lua(), -1)
+        c.lua_pop(self.state.lua(), 1)
+
+        out
+
+    // A string's bytes as they are, for a Lua string that is not text.
+    bytes(self) -> Result[[]u8, Error]
+        self.state.push_slot(self.slot)
+        val L = self.state.lua()
+        var len: usize = 0
+        val p = if c.lua_type(L, -1) == c.LUA_TSTRING || c.lua_type(L, -1) == c.LUA_TNUMBER then c.lua_tolstring(L, -1, &len) else null
+        val out: Result[[]u8, Error] = if usize(p) == 0 then Err(type_error(s"string expected, got ${type_name(L, -1)}")) else Ok(copy_bytes(p, len))
+        c.lua_pop(L, 1)
+
+        out
+
+    // What Lua's `tostring` makes of it, `__tostring` and `__name` included.
+    describe(self) -> Result[string, Error]
+        self.state.push_slot(self.slot)
+        self.state.protected(&p_tostring, 1, 1)?
+
+        val out = read_text(self.state.lua(), -1)
+        c.lua_pop(self.state.lua(), 1)
+
+        out match
+            Some(s) -> Ok(s)
+            None -> Err(type_error("'__tostring' answered bytes that are not UTF-8"))
+
+    // ### A table, or anything with metamethods
+    //
+    // **Every one of these runs the metamethods Lua's own `t[k]` would** (`__index`, `__newindex`,
+    // `__len`), inside a protected call, so a metamethod that errors answers `Err`.
+
+    get(self, key: string) -> Result[&Value, Error]
+        self.state.push_slot(self.slot)
+        self.state.push_text(key)
+        self.state.protected(&p_gettable, 2, 1)?
+
+        Ok(self.state.adopt())
+
+    at(self, i: i64) -> Result[&Value, Error]
+        self.state.push_slot(self.slot)
+        c.lua_pushinteger(self.state.lua(), i)
+        self.state.protected(&p_gettable, 2, 1)?
+
+        Ok(self.state.adopt())
+
+    // Any key at all: a table, a function, a boolean.
+    index(self, key: &Value) -> Result[&Value, Error]
+        self.state.push_slot(self.slot)
+        self.state.push(key)
+        self.state.protected(&p_gettable, 2, 1)?
+
+        Ok(self.state.adopt())
+
+    set(self, key: string, v: &Value) -> Result[unit, Error]
+        self.state.push_slot(self.slot)
+        self.state.push_text(key)
+        self.state.push(v)
+        self.state.protected(&p_settable, 3, 0)?
+
+        Ok(())
+
+    set_at(self, i: i64, v: &Value) -> Result[unit, Error]
+        self.state.push_slot(self.slot)
+        c.lua_pushinteger(self.state.lua(), i)
+        self.state.push(v)
+        self.state.protected(&p_settable, 3, 0)?
+
+        Ok(())
+
+    set_index(self, key: &Value, v: &Value) -> Result[unit, Error]
+        self.state.push_slot(self.slot)
+        self.state.push(key)
+        self.state.push(v)
+        self.state.protected(&p_settable, 3, 0)?
+
+        Ok(())
+
+    // The `#` operator.
+    len(self) -> Result[i64, Error]
+        self.state.push_slot(self.slot)
+        self.state.protected(&p_len, 1, 1)?
+
+        val n = c.lua_tointegerx(self.state.lua(), -1, null)
+        c.lua_pop(self.state.lua(), 1)
+
+        Ok(n)
+
+    // **Every key and value, in Lua's `next` order**, which is no order a program may rely on. It
+    // reads the table raw, as `next` does: no `__pairs`, no `__index`.
+    pairs(self) -> Result[Buf[(&Value, &Value)], Error]
+        val L = self.state.lua()
+
+        self.state.push_slot(self.slot)
+
+        if c.lua_type(L, -1) != c.LUA_TTABLE
+            val e = type_error(s"table expected, got ${type_name(L, -1)}")
+
+            c.lua_pop(L, 1)
+
+            return Err(e)
+        end if
+
+        var out: Buf[(&Value, &Value)] = buf()
+
+        c.lua_pushnil(L)
+
+        while c.lua_next(L, -2) != 0
+            val v = self.state.adopt()
+
+            c.lua_pushvalue(L, -1)
+            out.push((self.state.adopt(), v))
+
+        c.lua_pop(L, 1)
+
+        Ok(out)
+
+    // ### Calling it
+
+    // Calls it and answers its first result, or `nil` where it answered none.
+    call(self, args: []const &Value) -> Result[&Value, Error]
+        val all = self.call_all(args)?
+
+        Ok(if all.len() > 0 then all[0] else self.state.nil())
+
+    // Calls it and answers every result.
+    call_all(self, args: []const &Value) -> Result[Buf[&Value], Error]
+        val L = self.state.lua()
+
+        if c.lua_checkstack(L, int(args.len) + 2) == 0 then return Err(type_error("too many arguments to fit on Lua's stack"))
+
+        self.state.push_slot(self.slot)
+
+        for a in args do self.state.push(a)
+
+        val n = self.state.call_on_stack(int(args.len), c.LUA_MULTRET)?
+        var out: Buf[&Value] = buf()
+
+        // The results are on the stack in order and `adopt` pops from the top, so they are taken
+        // from the bottom: each is copied up and adopted, and the originals go at the end.
+        for i in 0..<n
+            c.lua_pushvalue(L, -n + i)
+            out.push(self.state.adopt())
+
+        c.lua_pop(L, n)
+
+        Ok(out)
+end Value
+
+impl Drop for Value
+    drop(self) = c.luaL_unref(self.state.lua(), c.LUA_REGISTRYINDEX, self.slot)
+
+impl Display for Value
+    display(self, out: *Writer, fmt: FormatSpec)
+        val rendered = self.describe() match
+            Ok(s) -> s
+            Err(e) -> s"<${e.message}>"
+
+        rendered.display(out, fmt)
+
+// ## Calling out of Lua, into sysl
+
+// What a registered function is handed.
+struct Call
+    // The state the script is running in, for making the values to answer with.
+    state: &State
+
+    // The arguments as the script passed them.
+    args: []const &Value
+
+    // The name the function was registered under, which its argument errors give.
+    name: string
+
+    // **Past the end is not an error**: Lua passes no value at all there, and this answers `nil`.
+    arg(self, i: usize) -> &Value = if i < self.args.len then self.args[i] else self.state.nil()
+
+    // ### The readers, which fail as `luaL_check*` does
+    //
+    // Each answers `Err` with the message Lua's own library would raise for the same argument, so a
+    // script's error handling cannot tell a sysl function from a C one.
+
+    //
+    // **An argument the script did not pass is `no value`, not `nil`**, in the message as in Lua's.
+    integer(self, i: usize) -> Result[i64, Error] =
+        if i < self.args.len then self.check(i, self.args[i].integer()) else Err(self.missing(i, "number"))
+
+    number(self, i: usize) -> Result[f64, Error] =
+        if i < self.args.len then self.check(i, self.args[i].number()) else Err(self.missing(i, "number"))
+
+    text(self, i: usize) -> Result[string, Error] =
+        if i < self.args.len then self.check(i, self.args[i].text()) else Err(self.missing(i, "string"))
+
+    // `luaL_opt*`: a missing or `nil` argument is the default, and anything else must convert.
+    integer_or(self, i: usize, default: i64) -> Result[i64, Error] =
+        if self.arg(i).is_nil() then Ok(default) else self.integer(i)
+
+    number_or(self, i: usize, default: f64) -> Result[f64, Error] =
+        if self.arg(i).is_nil() then Ok(default) else self.number(i)
+
+    text_or(self, i: usize, default: string) -> Result[string, Error] =
+        if self.arg(i).is_nil() then Ok(default) else self.text(i)
+
+    private check[T](self, i: usize, r: Result[T, Error]) -> Result[T, Error] =
+        r match
+            Ok(v) -> Ok(v)
+            Err(e) -> Err(Error(e.kind, s"bad argument #${i + 1} to '${self.name}' (${e.message})", ""))
+
+    private missing(self, i: usize, expected: string) -> Error =
+        Error(ErrorKind.Type, s"bad argument #${i + 1} to '${self.name}' (${expected} expected, got no value)", "")
+end Call
+
+// One registered function: the closure, the name its errors give, and a weak edge to its state.
+private[lua] enum Body
+    One(f: &Fn(Call) -> Result[&Value, Error])
+    Many(f: &Fn(Call) -> Result[Buf[&Value], Error])
+
+private[lua] struct Native
+    body: Body
+    state: weak State
+    name: string
+
+// **The function every registered closure is, as far as Lua knows.** Its one upvalue is the
+// `Native`'s address. `enter` does all the work and has returned — every count it held given back —
+// before `lua_error` is reached, so the `longjmp` it makes leaves no sysl frame holding anything:
+// this frame holds a raw pointer and an integer.
+private trampoline(L: *c.State) -> int
+    val native: *Native = ptr_cast(c.lua_touserdata(L, c.lua_upvalueindex(1)))
+    val n = enter(L, native)
+
+    if n < 0 then c.lua_error(L)
+
+    n
+
+private enter(L: *c.State, native: *Native) -> int
+    (*native).state.get() match
+        Some(s) -> s.invoke(L, native)
+        None -> raise(L, type_error(s"'${(*native).name}' was called while its state was closing"))
+
+// Pushes the message and answers -1, which tells `trampoline` to raise it.
+private raise(L: *c.State, e: Error) -> int
+    c.lua_pushlstring(L, as_ptr(e.message.bytes), e.message.bytes.len)
+
+    -1
+
+// ## The protected bodies
+//
+// Each is a `lua_CFunction` run under `lua_pcall`, which is what makes it safe for the C call inside
+// to raise: the `longjmp` lands in the `pcall`, and these frames hold nothing a jump could strand.
+
+private p_gettable(L: *c.State) -> int
+    c.lua_gettable(L, 1)
+
+    1
+
+private p_settable(L: *c.State) -> int
+    c.lua_settable(L, 1)
+
+    0
+
+private p_len(L: *c.State) -> int
+    c.lua_pushinteger(L, c.luaL_len(L, 1))
+
+    1
+
+private p_tostring(L: *c.State) -> int
+    c.luaL_tolstring(L, 1, null)
+
+    1
+
+private p_openlibs(L: *c.State) -> int
+    c.luaL_openlibs(L)
+
+    0
+
+private p_require(L: *c.State) -> int
+    c.luaL_requiref(L, c.lua_tolstring(L, 1, null), c.lua_tocfunction(L, 2), 1)
+
+    0
+
+// **The message handler**: it turns a non-string error into its `tostring`, and leaves a traceback
+// in the registry for `failure` to collect. It runs where the error was raised, which is the only
+// moment a traceback still describes the failure.
+private handler(L: *c.State) -> int
+    if c.lua_type(L, 1) != c.LUA_TSTRING && c.lua_type(L, 1) != c.LUA_TNUMBER
+        c.luaL_tolstring(L, 1, null)
+        c.lua_replace(L, 1)
+    end if
+
+    c.luaL_traceback(L, L, null, 1)
+    c.lua_setfield(L, c.LUA_REGISTRYINDEX, as_ptr(TRACEBACK.bytes))
+    c.lua_settop(L, 1)
+
+    1
+
+// **The step-limit hook.** Once it has fired it fires on every instruction, so a `pcall` in the
+// script that catches the error fails again at its very next step.
+//
+// The position is level 0's, the function the hook interrupted: a hook has no frame of its own, so
+// `luaL_error`'s level 1 would be that function's caller.
+private on_count(L: *c.State, ar: *c.Debug)
+    c.lua_sethook(L, &on_count, c.LUA_MASKCOUNT, 1)
+    c.luaL_where(L, 0)
+    c.lua_pushstring(L, as_ptr(STEP_LIMIT.bytes))
+    c.lua_concat(L, 2)
+    c.lua_error(L)
+
+// **The allocator**, counting what the state holds against its ceiling. Lua passes the old size as
+// `osize` only when `ptr` is not null (otherwise it is a type tag), and a shrink must never fail.
+private allocate(ud: *u8, ptr: *u8, osize: usize, nsize: usize) -> *u8
+    val s: *State = ptr_cast(ud)
+    val old = if usize(ptr) == 0 then 0 else osize
+
+    if nsize == 0
+        free(ptr)
+        (*s).used -= old
+
+        return null
+    end if
+
+    if (*s).cap > 0 && nsize > old && (*s).used - old + nsize > (*s).cap then return null
+
+    val p = realloc(ptr, nsize)
+
+    if usize(p) != 0 then (*s).used = (*s).used - old + nsize
+
+    p
+
+@needs(os)
+private extern realloc(p: *u8, n: usize) -> *u8
+
+@needs(os)
+private extern free(p: *u8)
+
+// ## Small conversions
+
+private val TRACEBACK = "sh.sysl.lua.traceback"
+private val STEP_LIMIT = "the step limit was reached"
+private val TEXT_MODE = "t"
+
+private error_kind(status: int) -> ErrorKind =
+    if status == c.LUA_ERRSYNTAX then ErrorKind.Syntax
+    else if status == c.LUA_ERRMEM then ErrorKind.Memory
+    else if status == c.LUA_ERRERR then ErrorKind.Handler
+    else if status == c.LUA_ERRFILE then ErrorKind.File
+    else ErrorKind.Runtime
+
+private kind_of(t: int) -> Kind =
+    if t == c.LUA_TBOOLEAN then Kind.Boolean
+    else if t == c.LUA_TLIGHTUSERDATA then Kind.LightUserdata
+    else if t == c.LUA_TNUMBER then Kind.Number
+    else if t == c.LUA_TSTRING then Kind.String
+    else if t == c.LUA_TTABLE then Kind.Table
+    else if t == c.LUA_TFUNCTION then Kind.Function
+    else if t == c.LUA_TUSERDATA then Kind.Userdata
+    else if t == c.LUA_TTHREAD then Kind.Thread
+    else Kind.Nil
+
+private library(lib: Library) -> (string, c.CFunction) =
+    lib match
+        Library.Base -> ("_G", &c.luaopen_base)
+        Library.Coroutine -> (c.LUA_COLIBNAME, &c.luaopen_coroutine)
+        Library.Table -> (c.LUA_TABLIBNAME, &c.luaopen_table)
+        Library.Io -> (c.LUA_IOLIBNAME, &c.luaopen_io)
+        Library.Os -> (c.LUA_OSLIBNAME, &c.luaopen_os)
+        Library.String -> (c.LUA_STRLIBNAME, &c.luaopen_string)
+        Library.Utf8 -> (c.LUA_UTF8LIBNAME, &c.luaopen_utf8)
+        Library.Math -> (c.LUA_MATHLIBNAME, &c.luaopen_math)
+        Library.Debug -> (c.LUA_DBLIBNAME, &c.luaopen_debug)
+        Library.Package -> (c.LUA_LOADLIBNAME, &c.luaopen_package)
+
+// **The name `luaL_typeerror` would give**: a `__name` from the metatable first, then `light
+// userdata`, then the basic type's name.
+private type_name(L: *c.State, idx: int) -> string
+    val at = c.lua_absindex(L, idx)
+
+    // `luaL_getmetafield` pushes nothing where there is no such field, and the field otherwise,
+    // whatever its type -- so anything it pushed is popped, string or not.
+    val t = c.luaL_getmetafield(L, at, as_ptr(NAME_FIELD.bytes))
+
+    if t != c.LUA_TNIL
+        val name = if t == c.LUA_TSTRING then read_text(L, -1) else None
+
+        c.lua_pop(L, 1)
+
+        name match
+            Some(n) -> return n
+            None -> ()
+    end if
+
+    if c.lua_type(L, at) == c.LUA_TLIGHTUSERDATA then return "light userdata"
+
+    read_cstring(c.luaL_typename(L, at))
+
+private val NAME_FIELD = "__name"
+
+private to_integer(L: *c.State, idx: int) -> Result[i64, Error]
+    var ok: int = 0
+    val n = c.lua_tointegerx(L, idx, &ok)
+
+    if ok != 0 then return Ok(n)
+
+    if c.lua_isnumber(L, idx) != 0 then return Err(type_error("number has no integer representation"))
+
+    Err(type_error(s"number expected, got ${type_name(L, idx)}"))
+
+private to_number(L: *c.State, idx: int) -> Result[f64, Error]
+    var ok: int = 0
+    val n = c.lua_tonumberx(L, idx, &ok)
+
+    if ok != 0 then return Ok(n)
+
+    Err(type_error(s"number expected, got ${type_name(L, idx)}"))
+
+private to_text(L: *c.State, idx: int) -> Result[string, Error]
+    val t = c.lua_type(L, idx)
+
+    if t != c.LUA_TSTRING && t != c.LUA_TNUMBER then return Err(type_error(s"string expected, got ${type_name(L, idx)}"))
+
+    read_text(L, idx) match
+        Some(s) -> Ok(s)
+        None -> Err(type_error("the string's bytes are not UTF-8"))
+
+// The string at `idx` copied out, or `None` where it is not a string or not UTF-8. A number at `idx`
+// is converted to a string in place, which is `lua_tolstring`'s doing.
+private read_text(L: *c.State, idx: int) -> Option[string]
+    var len: usize = 0
+    val p = c.lua_tolstring(L, idx, &len)
+
+    if usize(p) == 0 then return None
+
+    from_utf8(p[0..<len]) match
+        Ok(s) -> Some(s)
+        Err(_) -> None
+
+private read_cstring(p: *u8) -> string
+    var n: usize = 0
+
+    while p[n] != 0 do n += 1
+
+    from_utf8(p[0..<n]).unwrap_or("?")
+
+private copy_bytes(p: *u8, len: usize) -> []u8
+    var out: []u8 = [0; len]
+
+    for i in 0..<len do out[i] = p[i]
+
+    out

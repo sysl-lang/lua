@@ -1,0 +1,521 @@
+// What the embedding claims, checked against a running interpreter.
+//
+// **Two oracles stand behind these tests.** The reference manual's own worked examples (§6.4.1's
+// `string.gsub` results, the `lua` interpreter's expression-first rule) are reproduced value for
+// value, with a sysl function standing where the manual has a Lua one; and where this package writes
+// a message Lua's library also writes — `bad argument #1 to 'f' (number expected, got string)` —
+// the test asks Lua's own library for the same failure and compares the two. `suite_tests.sysl` runs
+// Lua's official test suite through the embedding.
+
+module sh.sysl.lua
+@tests
+
+import sysl.buf.{Buf, buf}
+import sysl.text.Search
+
+// -- running source -------------------------------------------------------------------------------
+
+@test("eval tries an expression first, as the interactive interpreter does")
+evaluates()
+    val lua = state().unwrap()
+
+    assert_eq(lua.eval("1 + 2").unwrap().integer().unwrap(), 3, "an expression needs no return")
+    assert_eq(lua.eval("local x = 6 return x * 7").unwrap().integer().unwrap(), 42, "a chunk is run as one")
+    assert(lua.eval("local x = 1").unwrap().is_nil(), "a chunk that answers nothing answers nil")
+
+@test("eval_all answers every value")
+evaluates_all()
+    val lua = state().unwrap()
+    val all = lua.eval_all("1, 'two', 3.5").unwrap()
+
+    assert_eq(all.len(), 3, "three values")
+    assert_eq(all[0].integer().unwrap(), 1, "the first")
+    assert_eq(all[1].text().unwrap(), "two", "the second")
+    assert_eq(all[2].number().unwrap(), 3.5, "the third")
+
+@test("run keeps its globals for the next run")
+runs()
+    val lua = state().unwrap()
+
+    lua.run("function greet(name) return 'hello, ' .. name end").unwrap()
+
+    assert_eq(lua.global("greet").unwrap().call([lua.text("sysl")]).unwrap().text().unwrap(), "hello, sysl", "a function defined by one run is called from sysl")
+
+@test("load compiles without running")
+loads()
+    val lua = state().unwrap()
+    val f = lua.load("ran = true").unwrap()
+
+    assert(lua.global("ran").unwrap().is_nil(), "nothing ran yet")
+    f.call([]).unwrap()
+    assert(lua.global("ran").unwrap().truthy(), "and now it has")
+
+@test("a syntax error is a Syntax error with Lua's message")
+syntax_error()
+    val lua = state().unwrap()
+    val e = lua.run("x = = 1").unwrap_err()
+
+    assert_eq(e.kind, ErrorKind.Syntax, "the kind")
+    assert_eq(e.message, "chunk:1: unexpected symbol near '='", "the message, with the chunk name")
+    assert_eq(e.traceback, "", "a syntax error has no call to trace")
+
+@test("the chunk name is the one a message gives")
+chunk_names()
+    val lua = state().unwrap()
+
+    assert_eq(lua.run("error('x')", "=config").unwrap_err().message, "config:1: x", "an '=' name is printed as it is")
+    assert_eq(lua.run("error('x')", "@init.lua").unwrap_err().message, "init.lua:1: x", "an '@' name is a file")
+
+@test("a runtime error carries a traceback taken where it was raised")
+runtime_error()
+    val lua = state().unwrap()
+
+    lua.run("function inner() error('boom') end\nfunction outer() inner() end").unwrap()
+
+    val e = lua.global("outer").unwrap().call([]).unwrap_err()
+
+    assert_eq(e.kind, ErrorKind.Runtime, "the kind")
+    assert_eq(e.message, "chunk:1: boom", "the message")
+    assert(e.traceback.starts_with("stack traceback:"), "a traceback")
+    assert(e.traceback.contains("in function 'inner'"), "naming the function that raised")
+    assert(e.traceback.contains("in function 'outer'"), "and its caller")
+    assert(e.to_string().contains("\nstack traceback:"), "Display prints both")
+
+@test("an error object that is not a string is described")
+error_objects()
+    val lua = state().unwrap()
+
+    assert(lua.run("error({})").unwrap_err().message.starts_with("table: "), "a table is named as tostring names it")
+    assert_eq(lua.run("error(setmetatable({}, {__tostring = function() return 'custom' end}))").unwrap_err().message, "custom", "__tostring is used")
+    assert_eq(lua.run("error(42)").unwrap_err().message, "42", "a number reads as one")
+    assert_eq(lua.run("error()").unwrap_err().message, "nil", "and nothing is nil")
+
+@test("a state stays usable after an error")
+recovers()
+    val lua = state().unwrap()
+
+    assert(lua.run("error('x')").is_err(), "the failure")
+    assert_eq(lua.eval("1 + 1").unwrap().integer().unwrap(), 2, "the next call is unaffected")
+
+@test("files load, and a missing one is a File error")
+files()
+    val lua = state().unwrap()
+
+    lua.run_file("testdata/greeting.lua").unwrap()
+    assert_eq(lua.global("greeting").unwrap().text().unwrap(), "hello from a file", "the file ran")
+
+    val e = lua.load_file("testdata/nope.lua").unwrap_err()
+
+    assert_eq(e.kind, ErrorKind.File, "the kind")
+    assert(e.message.starts_with("cannot open testdata/nope.lua"), "naming the path")
+
+// -- values ---------------------------------------------------------------------------------------
+
+@test("every constructor makes the kind it says")
+kinds()
+    val lua = state().unwrap()
+
+    assert_eq(lua.nil().kind(), Kind.Nil, "nil")
+    assert_eq(lua.boolean(true).kind(), Kind.Boolean, "boolean")
+    assert_eq(lua.integer(1).kind(), Kind.Number, "integer")
+    assert_eq(lua.number(1.5).kind(), Kind.Number, "number")
+    assert_eq(lua.text("x").kind(), Kind.String, "text")
+    assert_eq(lua.table().kind(), Kind.Table, "table")
+    assert_eq(lua.eval("print").unwrap().kind(), Kind.Function, "a function")
+    assert_eq(lua.eval("io.stdout").unwrap().kind(), Kind.Userdata, "a userdata")
+    assert_eq(lua.eval("coroutine.create(print)").unwrap().kind(), Kind.Thread, "a thread")
+
+@test("a value made in sysl is the value Lua sees")
+round_trips()
+    val lua = state().unwrap()
+
+    lua.set_global("i", lua.integer(-7)).unwrap()
+    lua.set_global("f", lua.number(0.25)).unwrap()
+    lua.set_global("s", lua.text("a\u{0}b")).unwrap()
+    lua.set_global("t", lua.boolean(false)).unwrap()
+
+    assert(lua.eval("math.type(i) == 'integer' and i == -7").unwrap().truthy(), "an integer stays an integer")
+    assert(lua.eval("math.type(f) == 'float' and f == 0.25").unwrap().truthy(), "a float stays a float")
+    assert(lua.eval("#s == 3 and s:byte(2) == 0").unwrap().truthy(), "a string may hold a zero byte")
+    assert(lua.eval("t == false").unwrap().truthy(), "false is false")
+
+@test("truth is Lua's: only nil and false are false")
+truth()
+    val lua = state().unwrap()
+
+    assert(!lua.nil().truthy(), "nil")
+    assert(!lua.boolean(false).truthy(), "false")
+    assert(lua.integer(0).truthy(), "zero is true")
+    assert(lua.text("").truthy(), "the empty string is true")
+
+@test("integer conversion follows Lua's rules")
+integers()
+    val lua = state().unwrap()
+
+    assert_eq(lua.eval("'10'").unwrap().integer().unwrap(), 10, "a numeric string converts")
+    assert_eq(lua.eval("10.0").unwrap().integer().unwrap(), 10, "an integral float converts")
+    assert_eq(lua.eval("math.maxinteger").unwrap().integer().unwrap(), 9223372036854775807, "the widest")
+    assert_eq(lua.eval("10.5").unwrap().integer().unwrap_err().message, "number has no integer representation", "a fraction does not")
+    assert_eq(lua.eval("{}").unwrap().integer().unwrap_err().message, "number expected, got table", "a table does not")
+    assert_eq(lua.eval("'x'").unwrap().number().unwrap_err().message, "number expected, got string", "nor a word")
+    assert_eq(lua.eval("io.stdout").unwrap().integer().unwrap_err().message, "number expected, got FILE*", "a userdata's __name is used")
+
+@test("text conversion follows Lua's rules")
+texts()
+    val lua = state().unwrap()
+
+    assert_eq(lua.eval("10").unwrap().text().unwrap(), "10", "an integer is written as Lua writes it")
+    assert_eq(lua.eval("3.5").unwrap().text().unwrap(), "3.5", "and a float")
+    assert_eq(lua.eval("1e100").unwrap().text().unwrap(), "1e+100", "with %.14g")
+    assert_eq(lua.eval("true").unwrap().text().unwrap_err().message, "string expected, got boolean", "a boolean is not text")
+    assert_eq(lua.eval("'\\255'").unwrap().text().unwrap_err().kind, ErrorKind.Type, "bytes that are not UTF-8 are not text")
+    assert_eq(lua.eval("'\\255\\0'").unwrap().bytes().unwrap(), [255u8, 0], "but they are bytes")
+    assert_eq(lua.eval("{}").unwrap().bytes().unwrap_err().message, "string expected, got table", "and a table is neither")
+
+@test("describe is Lua's tostring")
+describes()
+    val lua = state().unwrap()
+
+    assert_eq(lua.eval("nil").unwrap().describe().unwrap(), "nil", "nil")
+    assert_eq(lua.eval("setmetatable({}, {__tostring = function() return 'point' end})").unwrap().to_string(), "point", "__tostring, through Display")
+    assert(lua.eval("setmetatable({}, {__name = 'Box'})").unwrap().describe().unwrap().starts_with("Box: "), "__name")
+    assert(lua.eval("setmetatable({}, {__tostring = function() error('no') end})").unwrap().describe().is_err(), "a __tostring that fails is an Err")
+
+// -- tables ---------------------------------------------------------------------------------------
+
+@test("a table is read and written by key and by index")
+tables()
+    val lua = state().unwrap()
+    val t = lua.table()
+
+    t.set("name", lua.text("lua")).unwrap()
+    t.set_at(1, lua.integer(10)).unwrap()
+    t.set_at(2, lua.integer(20)).unwrap()
+    t.set_index(lua.boolean(true), lua.text("yes")).unwrap()
+
+    assert_eq(t.get("name").unwrap().text().unwrap(), "lua", "by name")
+    assert_eq(t.at(2).unwrap().integer().unwrap(), 20, "by index")
+    assert_eq(t.index(lua.boolean(true)).unwrap().text().unwrap(), "yes", "by any value")
+    assert_eq(t.len().unwrap(), 2, "the border")
+    assert(t.get("absent").unwrap().is_nil(), "an absent key is nil")
+
+    lua.set_global("t", t).unwrap()
+
+    assert(lua.eval("t.name == 'lua' and t[1] == 10 and t[true] == 'yes'").unwrap().truthy(), "Lua sees the same table")
+
+@test("pairs visits every entry once")
+pairs()
+    val lua = state().unwrap()
+    val t = lua.eval("{10, 20, x = 'a', y = 'b'}").unwrap()
+    var ints = 0
+    var keys = ""
+
+    for (k, v) in t.pairs().unwrap()
+        if k.kind() == Kind.Number then ints += v.integer().unwrap() else keys = keys + k.text().unwrap() + v.text().unwrap()
+
+    assert_eq(ints, 30, "both array entries")
+    assert_eq(keys.len, 4, "both named ones")
+    assert(keys.contains("xa") && keys.contains("yb"), "each with its value")
+    assert_eq(lua.integer(1).pairs().unwrap_err().message, "table expected, got number", "only a table has pairs")
+
+@test("metamethods run, and one that fails is an Err")
+metamethods()
+    val lua = state().unwrap()
+    val t = lua.eval("setmetatable({}, {__index = function(_, k) return k .. '!' end, __len = function() return 99 end})").unwrap()
+
+    assert_eq(t.get("hi").unwrap().text().unwrap(), "hi!", "__index")
+    assert_eq(t.len().unwrap(), 99, "__len")
+
+    val bad = lua.eval("setmetatable({}, {__index = function() error('no reading') end, __newindex = function() error('no writing') end})").unwrap()
+
+    assert_eq(bad.get("x").unwrap_err().message, "chunk:1: no reading", "__index raising")
+    assert_eq(bad.set("x", lua.nil()).unwrap_err().message, "chunk:1: no writing", "__newindex raising")
+    assert(lua.integer(1).get("x").unwrap_err().message.contains("attempt to index a number value"), "indexing a number")
+
+@test("a global table with metamethods is honoured too")
+strict_globals()
+    val lua = state().unwrap()
+
+    lua.run("setmetatable(_G, {__index = function(_, k) error('undeclared ' .. k, 2) end})").unwrap()
+
+    assert(lua.global("nothing").unwrap_err().message.contains("undeclared nothing"), "global goes through __index")
+
+// -- calling --------------------------------------------------------------------------------------
+
+@test("call passes arguments and answers results")
+calls()
+    val lua = state().unwrap()
+    val f = lua.eval("function(a, b) return a + b, a * b end").unwrap()
+    val all = f.call_all([lua.integer(3), lua.integer(4)]).unwrap()
+
+    assert_eq(all.len(), 2, "two results")
+    assert_eq(all[0].integer().unwrap(), 7, "in order")
+    assert_eq(all[1].integer().unwrap(), 12, "both")
+    assert_eq(f.call([lua.integer(3), lua.integer(4)]).unwrap().integer().unwrap(), 7, "call answers the first")
+    assert(lua.eval("function() end").unwrap().call([]).unwrap().is_nil(), "and nil where there is none")
+    assert(lua.integer(1).call([]).unwrap_err().message.contains("attempt to call a number value"), "a number is not callable")
+
+@test("the manual's lua_call example, through the pleasant layer")
+manual_call()
+    // Manual §4.6, lua_call: `a = f("how", t.x, 14)`, with `f` concatenating what it is given.
+    val lua = state().unwrap()
+
+    lua.run("function f(...) return table.concat({...}, ' ') end  t = {x = 'are'}").unwrap()
+
+    val f = lua.global("f").unwrap()
+    val t = lua.global("t").unwrap()
+
+    lua.set_global("a", f.call([lua.text("how"), t.get("x").unwrap(), lua.integer(14)]).unwrap()).unwrap()
+
+    assert_eq(lua.global("a").unwrap().text().unwrap(), "how are 14", "the same call the manual makes in C")
+
+// -- sysl functions -------------------------------------------------------------------------------
+
+@test("a sysl closure is a Lua function")
+defines()
+    val lua = state().unwrap()
+    val scale = 3
+
+    lua.define("scale", (call) -> Ok(call.state.integer(call.integer(0)? * scale))).unwrap()
+
+    assert_eq(lua.eval("scale(14)").unwrap().integer().unwrap(), 42, "called by name")
+    assert_eq(lua.eval("type(scale)").unwrap().text().unwrap(), "function", "it is a function to Lua")
+
+@test("an argument error reads exactly as Lua's own library's")
+argument_errors()
+    val lua = state().unwrap()
+
+    lua.define("scale", (call) -> Ok(call.state.number(call.number(0)? * 2.0))).unwrap()
+    lua.define("shout", (call) -> Ok(call.state.text(call.text(0)?))).unwrap()
+    lua.define("whole", (call) -> Ok(call.state.integer(call.integer(1)?))).unwrap()
+
+    // The oracle is the same mistake made against C functions of Lua's own. Each is moved to a
+    // global of its own first, since Lua names a library function by the table it is found in
+    // ('math.abs') and a global one by its global name, which is what a sysl function is.
+    lua.run("cabs, cupper, crep = math.abs, string.upper, string.rep  math.abs, string.upper, string.rep = nil, nil, nil").unwrap()
+
+    val ours = lua.eval("select(2, pcall(scale, 'x'))").unwrap().text().unwrap()
+    val theirs = lua.eval("select(2, pcall(cabs, 'x'))").unwrap().text().unwrap()
+
+    assert_eq(theirs, "bad argument #1 to 'cabs' (number expected, got string)", "Lua's own message")
+    assert_eq(ours, "bad argument #1 to 'scale' (number expected, got string)", "and this one, word for word")
+
+    assert_eq(lua.eval("select(2, pcall(shout, {}))").unwrap().text().unwrap(), lua.eval("(select(2, pcall(cupper, {})):gsub('cupper', 'shout'))").unwrap().text().unwrap(), "a string argument")
+    assert_eq(lua.eval("select(2, pcall(whole, 1, 2.5))").unwrap().text().unwrap(), lua.eval("(select(2, pcall(crep, 'x', 2.5)):gsub('crep', 'whole'))").unwrap().text().unwrap(), "no integer representation")
+    assert_eq(lua.eval("select(2, pcall(whole, 1))").unwrap().text().unwrap(), lua.eval("(select(2, pcall(crep, 'x')):gsub('crep', 'whole'))").unwrap().text().unwrap(), "a missing argument is 'no value', not nil")
+    assert_eq(lua.eval("select(2, pcall(whole, 1))").unwrap().text().unwrap(), "bad argument #2 to 'whole' (number expected, got no value)", "spelled out")
+
+@test("optional arguments take their default only when absent or nil")
+optional_arguments()
+    val lua = state().unwrap()
+
+    lua.define("pad", (call) -> Ok(call.state.integer(call.integer_or(0, 8)?))).unwrap()
+    lua.define("label", (call) -> Ok(call.state.text(call.text_or(0, "none")?))).unwrap()
+    lua.define("ratio", (call) -> Ok(call.state.number(call.number_or(0, 0.5)?))).unwrap()
+
+    assert_eq(lua.eval("pad()").unwrap().integer().unwrap(), 8, "absent")
+    assert_eq(lua.eval("pad(nil)").unwrap().integer().unwrap(), 8, "nil")
+    assert_eq(lua.eval("pad(3)").unwrap().integer().unwrap(), 3, "given")
+    assert(lua.eval("pcall(pad, 'x')").unwrap().truthy() == false, "given wrongly is still an error")
+    assert_eq(lua.eval("label()").unwrap().text().unwrap(), "none", "a text default")
+    assert_eq(lua.eval("ratio()").unwrap().number().unwrap(), 0.5, "a number default")
+
+@test("a sysl Err is a Lua error a script can catch")
+errors_cross()
+    val lua = state().unwrap()
+
+    lua.define("refuse", (call) -> Err(Error(ErrorKind.Runtime, "refused", ""))).unwrap()
+
+    assert_eq(lua.eval("select(2, pcall(refuse))").unwrap().text().unwrap(), "refused", "pcall catches it")
+
+    val e = lua.run("refuse()").unwrap_err()
+
+    assert_eq(e.message, "refused", "uncaught, it reaches sysl again")
+    assert(e.traceback.contains("in function 'refuse'"), "with the sysl function in the traceback")
+
+@test("a sysl function may answer several values")
+defines_many()
+    val lua = state().unwrap()
+
+    lua.define_many("divmod", (call) ->
+        val a = call.integer(0)?
+        val b = call.integer(1)?
+        var out: Buf[&Value] = buf()
+        out.push(call.state.integer(a / b))
+        out.push(call.state.integer(a % b))
+        Ok(out)
+    ).unwrap()
+
+    assert_eq(lua.eval("select('#', divmod(17, 5))").unwrap().integer().unwrap(), 2, "two values")
+    assert(lua.eval("(function() local q, r = divmod(17, 5) return q == 3 and r == 2 end)()").unwrap().truthy(), "in order")
+
+@test("arguments past the end are nil, and the count is what was passed")
+argument_count()
+    val lua = state().unwrap()
+
+    lua.define("count", (call) -> Ok(call.state.integer(i64(call.args.len)))).unwrap()
+    lua.define("third", (call) -> Ok(call.arg(2))).unwrap()
+
+    assert_eq(lua.eval("count(1, nil, 3)").unwrap().integer().unwrap(), 3, "a nil in the middle counts")
+    assert_eq(lua.eval("count()").unwrap().integer().unwrap(), 0, "none")
+    assert(lua.eval("third(1) == nil").unwrap().truthy(), "past the end is nil")
+    assert_eq(lua.eval("third(1, 2, 'c')").unwrap().text().unwrap(), "c", "the value itself is handed back")
+
+@test("a sysl function may call back into Lua")
+reenters()
+    val lua = state().unwrap()
+
+    lua.define("apply", (call) -> call.arg(0).call([call.arg(1)])).unwrap()
+
+    assert_eq(lua.eval("apply(function(x) return x * 2 end, 21)").unwrap().integer().unwrap(), 42, "a Lua function called from sysl called from Lua")
+    assert_eq(lua.eval("select(2, pcall(apply, function() error('inner', 0) end))").unwrap().text().unwrap(), "inner", "an inner error passes back out")
+    assert_eq(lua.eval("apply(apply, function(x) return 'deep' end)").unwrap().text().unwrap(), "deep", "nested twice")
+
+@test("a sysl function runs inside a coroutine")
+coroutines()
+    val lua = state().unwrap()
+
+    lua.define("twice", (call) -> Ok(call.state.integer(call.integer(0)? * 2))).unwrap()
+
+    val r = lua.eval("coroutine.wrap(function(a) local b = coroutine.yield(twice(a)) return twice(b) end)").unwrap()
+
+    assert_eq(r.call([lua.integer(5)]).unwrap().integer().unwrap(), 10, "before the yield")
+    assert_eq(r.call([lua.integer(7)]).unwrap().integer().unwrap(), 14, "and after")
+
+@test("the manual's string.gsub examples, with a sysl function as the replacement")
+manual_gsub()
+    // Manual §6.4.1. The last example's replacement is a Lua function running `load`; here it is a
+    // sysl function doing the same through the embedding.
+    val lua = state().unwrap()
+
+    lua.define("expand", (call) -> call.state.load(call.text(0)?)?.call([])).unwrap()
+
+    assert_eq(lua.eval("(string.gsub('hello world', '(%w+)', '%1 %1'))").unwrap().text().unwrap(), "hello hello world world", "x = 1")
+    assert_eq(lua.eval("(string.gsub('hello world', '%w+', '%0 %0', 1))").unwrap().text().unwrap(), "hello hello world", "x = 2")
+    assert_eq(lua.eval("(string.gsub('hello world from Lua', '(%w+)%s*(%w+)', '%2 %1'))").unwrap().text().unwrap(), "world hello Lua from", "x = 3")
+    assert_eq(lua.eval("(string.gsub('4+5 = $return 4+5$', '%$(.-)%$', expand))").unwrap().text().unwrap(), "4+5 = 9", "x = 5, through sysl")
+
+    val t = lua.table()
+
+    t.set("name", lua.text("lua")).unwrap()
+    t.set("version", lua.text("5.4")).unwrap()
+    lua.set_global("t", t).unwrap()
+
+    assert_eq(lua.eval("(string.gsub('$name-$version.tar.gz', '%$(%w+)', t))").unwrap().text().unwrap(), "lua-5.4.tar.gz", "x = 6, with a table made in sysl")
+
+// Counts its own destructions; only `closures_freed` makes one.
+private var witnesses_dropped = 0
+
+struct Witness
+    id: int
+
+impl Drop for Witness
+    drop(self) = witnesses_dropped += 1
+
+private register_and_close()
+    val w: &Witness = Witness(7)
+    val lua = state().unwrap()
+
+    lua.define("hold", (call) -> Ok(call.state.integer(i64(w.id)))).unwrap()
+    assert_eq(lua.eval("hold()").unwrap().integer().unwrap(), 7, "the closure ran")
+    assert_eq(witnesses_dropped, 0, "and nothing was freed yet")
+
+@test("a registered closure, and what it captured, are freed with its state")
+closures_freed()
+    register_and_close()
+
+    assert_eq(witnesses_dropped, 1, "the captured value was dropped once")
+
+// -- what a script may do -------------------------------------------------------------------------
+
+@test("bare opens nothing, and open adds one library at a time")
+libraries()
+    val lua = bare().unwrap()
+
+    assert(lua.global("print").unwrap().is_nil(), "no print")
+    assert(lua.global("string").unwrap().is_nil(), "no string library")
+
+    lua.open(Library.Base).unwrap()
+    assert(lua.global("print").unwrap().kind() == Kind.Function, "the base library sets print")
+    assert(lua.global("string").unwrap().is_nil(), "and nothing else")
+
+    lua.open(Library.String).unwrap()
+    assert_eq(lua.eval("('x'):rep(3)").unwrap().text().unwrap(), "xxx", "string methods once string is open")
+    assert(lua.global("io").unwrap().is_nil(), "io stays closed")
+
+    for lib in [Library.Coroutine, Library.Table, Library.Io, Library.Os, Library.Utf8, Library.Math, Library.Debug, Library.Package]
+        lua.open(lib).unwrap()
+
+    assert(lua.eval("coroutine and table and io and os and utf8 and math and debug and package and true").unwrap().truthy(), "every library opens by name")
+    assert(lua.eval("package.loaded.string == string").unwrap().truthy(), "and is registered as require would")
+
+@test("limit_memory refuses past the ceiling, as a Memory error")
+memory_limit()
+    val lua = state().unwrap()
+    val before = lua.memory_used()
+
+    assert(before > 0, "a state holds memory from the start")
+
+    lua.limit_memory(before + 64 * 1024)
+
+    val e = lua.run("local s = string.rep('x', 1000000)").unwrap_err()
+
+    assert_eq(e.kind, ErrorKind.Memory, "the kind")
+    assert_eq(e.message, "not enough memory", "Lua's message")
+    assert_eq(lua.eval("1 + 1").unwrap().integer().unwrap(), 2, "small work goes on under the ceiling")
+
+    lua.limit_memory(0)
+    lua.run("local s = string.rep('x', 1000000)").unwrap()
+
+@test("memory_used tracks what the interpreter holds")
+memory_used()
+    val lua = state().unwrap()
+    val before = lua.memory_used()
+
+    lua.run("big = string.rep('x', 100000)").unwrap()
+    assert(lua.memory_used() > before + 100000, "a large string is counted")
+
+    lua.run("big = nil").unwrap()
+    lua.collect()
+    assert(lua.memory_used() < before + 100000, "and given back when collected")
+
+@test("limit_steps stops a loop, and a pcall in the script cannot keep it going")
+step_limit()
+    val lua = state().unwrap()
+
+    lua.limit_steps(10000)
+
+    assert_eq(lua.run("while true do end").unwrap_err().message, "chunk:1: the step limit was reached", "an endless loop")
+    assert(lua.run("while true do pcall(function() while true do end end) end").is_err(), "a pcall catching the limit")
+    assert_eq(lua.eval("1 + 1").unwrap().integer().unwrap(), 2, "each call from sysl is counted afresh")
+    lua.run("for i = 1, 100 do end").unwrap()
+
+    lua.limit_steps(0)
+    lua.run("for i = 1, 100000 do end").unwrap()
+
+// -- lifetimes ------------------------------------------------------------------------------------
+
+@test("a value keeps its state alive")
+outlives()
+    val v = state().unwrap().eval("{answer = 42}").unwrap()
+
+    assert_eq(v.get("answer").unwrap().integer().unwrap(), 42, "the state is gone from every name but the value's")
+
+@test("dropping values gives their registry slots back")
+slots_returned()
+    val lua = state().unwrap()
+
+    for i in 0..<1000
+        val t = lua.table()
+        t.set_at(1, lua.integer(i)).unwrap()
+
+    lua.collect()
+
+    val before = lua.memory_used()
+
+    for i in 0..<1000
+        val t = lua.table()
+        t.set_at(1, lua.integer(i)).unwrap()
+
+    lua.collect()
+    assert(lua.memory_used() <= before + 1024, "a second thousand tables cost no more than the first left behind")

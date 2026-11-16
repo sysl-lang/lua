@@ -1,0 +1,58 @@
+// Lua 5.4 for sysl: run a script, read what it left, and hand it sysl functions to call.
+//
+//     dependencies {
+//       lua { git = "github.com/sysl-lang/lua", version = "0.1.0" }
+//     }
+//
+// The coordinate is identity rather than a URL, and the version is the tag `v0.1.0` here. The module
+// a program imports is `sh.sysl.lua`.
+
+package {
+  name    = "lua"
+  version = "0.1.0"
+
+  // The compiler this was written against and the only one it is known to build with.
+  sysl = "0.11.5"
+}
+
+// **Lua is VENDORED, and that is a claim about where it runs.** Lua is written to be embedded in
+// anything with a C library: every one of its 33 files compiles for a Cortex-M33 against newlib
+// (`arm-none-eabi-gcc -c -mcpu=cortex-m33`), and Lua on a microcontroller is an established use
+// (NodeMCU, eLua). A bare target with no libc does not build it — `string.h`, `setjmp.h` and
+// `math.h` are where it stops — so the board is one with a C library: the Pico SDK, Zephyr, FreeRTOS.
+//
+// Homebrew is not the source for a second reason: its `lua` formula is now 5.5, and `lua@5.4` is
+// keg-only and deprecated, so a `pkg_config` package would find a different language than this one.
+//
+// **`c/lua/` is upstream's `src/` byte for byte**, from `lua-5.4.9.tar.gz` (README records the hash),
+// so a re-vendor is a copy over it. `lua.c` and `luac.c` are the two command-line programs and each
+// defines a `main`, which is why they are excluded rather than deleted.
+c {
+  lua {
+    root    = "c/lua"
+    include = ["."]
+    sources = ["*.c"]
+    exclude = ["lua.c", "luac.c"]
+  }
+}
+
+// **`LUA_USE_POSIX` on every machine that is POSIX**, which is what upstream's own `make macosx` and
+// `make linux` set: `os.tmpname` then uses `mkstemp` rather than the deprecated `tmpnam`, and
+// `io.popen` works. `LUA_USE_DLOPEN` is deliberately left off, so `require` cannot load a C module
+// from a shared library — an embedding hands Lua its sysl functions instead, and a binary C module
+// built against some other Lua would be one more ABI to get wrong. A board build sets neither, and
+// gets upstream's portable ISO C configuration.
+targets {
+  aarch64-macos   { c { lua { defines { LUA_USE_POSIX = true } } } }
+  x86_64-macos    { c { lua { defines { LUA_USE_POSIX = true } } } }
+  aarch64-linux   { c { lua { defines { LUA_USE_POSIX = true } } } }
+  x86_64-linux    { c { lua { defines { LUA_USE_POSIX = true } } } }
+  riscv64-linux   { c { lua { defines { LUA_USE_POSIX = true } } } }
+  aarch64-android { c { lua { defines { LUA_USE_POSIX = true } } } }
+}
+
+// `os` because the interpreter's libraries open files, read the clock and allocate through libc.
+requires {
+  os   = true
+  heap = true
+}
