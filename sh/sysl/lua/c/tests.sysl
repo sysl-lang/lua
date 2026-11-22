@@ -10,13 +10,9 @@ module sh.sysl.lua.c
 import sysl.raw.ptr_cast
 import sysl.buf.{Buf, buf}
 import sysl.slices.as_ptr
-import sysl.text.{from_cstring, from_utf8}
+import sysl.text.{cstring, from_cstring, from_utf8}
 
 // -- helpers --------------------------------------------------------------------------------------
-
-// A literal's address, for a `const char *`. **Only a literal**: it is the one `string` that is
-// NUL-terminated.
-private z(s: string) -> *u8 = as_ptr(s.bytes)
 
 
 private text_at(L: *State, idx: int) -> string
@@ -31,7 +27,7 @@ private cstr(p: *u8) -> string = if usize(p) == 0 then "<null>" else from_cstrin
 
 // Runs `src` and leaves its first result on the stack.
 private eval(L: *State, src: string) -> int
-    val status = luaL_loadbufferx(L, as_ptr(src.bytes), src.bytes.len, z("=t"), null)
+    val status = luaL_loadbufferx(L, as_ptr(src.bytes), src.bytes.len, c"=t", null)
 
     if status != LUA_OK then return status
 
@@ -107,18 +103,19 @@ registry()
 library_names()
     val L = fresh()
 
-    lua_getfield(L, LUA_REGISTRYINDEX, z(LUA_LOADED_TABLE))
+    lua_getfield(L, LUA_REGISTRYINDEX, c"_LOADED")
     assert(lua_istable(L, -1), "_LOADED is in the registry")
 
     for name in [LUA_GNAME, LUA_COLIBNAME, LUA_TABLIBNAME, LUA_IOLIBNAME, LUA_OSLIBNAME, LUA_STRLIBNAME, LUA_UTF8LIBNAME, LUA_MATHLIBNAME, LUA_DBLIBNAME, LUA_LOADLIBNAME]
-        assert_eq(lua_getfield(L, -1, z(name)), LUA_TTABLE, name)
+        val key = cstring(name)
+        assert_eq(lua_getfield(L, -1, key.ptr), LUA_TTABLE, name)
         lua_pop(L, 1)
 
     lua_pop(L, 1)
-    lua_getfield(L, LUA_REGISTRYINDEX, z(LUA_PRELOAD_TABLE))
+    lua_getfield(L, LUA_REGISTRYINDEX, c"_PRELOAD")
     assert(lua_istable(L, -1), "_PRELOAD is in the registry")
     lua_pop(L, 1)
-    assert(luaL_getmetatable(L, z(LUA_FILEHANDLE)) == LUA_TTABLE, "FILE* is the io library's metatable")
+    assert(luaL_getmetatable(L, c"FILE*") == LUA_TTABLE, "FILE* is the io library's metatable")
     lua_close(L)
 
 // -- the stack ------------------------------------------------------------------------------------
@@ -165,7 +162,7 @@ access()
 
     lua_pushinteger(L, 7)
     lua_pushnumber(L, 2.5)
-    lua_pushstring(L, z("12"))
+    lua_pushstring(L, c"12")
     lua_pushboolean(L, 0)
     lua_pushnil(L)
     lua_pushlightuserdata(L, ptr_cast(L))
@@ -226,17 +223,17 @@ operators()
     assert(lua_rawequal(L, -1, -2) != 0, "rawequal agrees")
 
     lua_settop(L, 0)
-    lua_pushstring(L, z("a"))
+    lua_pushstring(L, c"a")
     lua_pushinteger(L, 1)
-    lua_pushstring(L, z("b"))
+    lua_pushstring(L, c"b")
     lua_concat(L, 3)
     assert_eq(text_at(L, -1), "a1b", "concat joins and converts")
     lua_len(L, -1)
     assert_eq(lua_tointeger(L, -1), 3, "len pushes the length")
 
-    assert_eq(lua_stringtonumber(L, z("0x10")), 5, "stringtonumber answers the size with the terminator")
+    assert_eq(lua_stringtonumber(L, c"0x10"), 5, "stringtonumber answers the size with the terminator")
     assert_eq(lua_tointeger(L, -1), 16, "and pushes the number")
-    assert_eq(lua_stringtonumber(L, z("nope")), 0, "and 0 for a string that is not one")
+    assert_eq(lua_stringtonumber(L, c"nope"), 0, "and 0 for a string that is not one")
     lua_close(L)
 
 // -- tables ---------------------------------------------------------------------------------------
@@ -247,33 +244,33 @@ tables()
     var key: u8 = 0
 
     lua_createtable(L, 2, 1)
-    lua_pushstring(L, z("v"))
-    lua_setfield(L, 1, z("k"))
+    lua_pushstring(L, c"v")
+    lua_setfield(L, 1, c"k")
     lua_pushinteger(L, 10)
     lua_seti(L, 1, 1)
     lua_pushinteger(L, 20)
     lua_rawseti(L, 1, 2)
-    lua_pushstring(L, z("rk"))
-    lua_pushstring(L, z("rv"))
+    lua_pushstring(L, c"rk")
+    lua_pushstring(L, c"rv")
     lua_rawset(L, 1)
-    lua_pushstring(L, z("pv"))
+    lua_pushstring(L, c"pv")
     lua_rawsetp(L, 1, &key)
-    lua_pushstring(L, z("t"))
+    lua_pushstring(L, c"t")
     lua_pushboolean(L, 1)
     lua_settable(L, 1)
 
-    assert_eq(lua_getfield(L, 1, z("k")), LUA_TSTRING, "getfield answers the type")
+    assert_eq(lua_getfield(L, 1, c"k"), LUA_TSTRING, "getfield answers the type")
     assert_eq(text_at(L, -1), "v", "setfield/getfield")
     assert_eq(lua_geti(L, 1, 1), LUA_TNUMBER, "geti")
     assert_eq(lua_tointeger(L, -1), 10, "seti/geti")
     lua_rawgeti(L, 1, 2)
     assert_eq(lua_tointeger(L, -1), 20, "rawseti/rawgeti")
-    lua_pushstring(L, z("rk"))
+    lua_pushstring(L, c"rk")
     lua_rawget(L, 1)
     assert_eq(text_at(L, -1), "rv", "rawset/rawget")
     lua_rawgetp(L, 1, &key)
     assert_eq(text_at(L, -1), "pv", "rawsetp/rawgetp key on an address")
-    lua_pushstring(L, z("t"))
+    lua_pushstring(L, c"t")
     lua_gettable(L, 1)
     assert(lua_toboolean(L, -1) != 0, "settable/gettable")
     lua_settop(L, 1)
@@ -291,12 +288,12 @@ tables()
     assert_eq(n, 6, "next visits every entry")
 
     lua_pushvalue(L, 1)
-    lua_setglobal(L, z("g"))
-    assert_eq(lua_getglobal(L, z("g")), LUA_TTABLE, "setglobal/getglobal")
+    lua_setglobal(L, c"g")
+    assert_eq(lua_getglobal(L, c"g"), LUA_TTABLE, "setglobal/getglobal")
     assert(lua_rawequal(L, 1, -1) != 0, "the same table")
 
-    assert_eq(luaL_getsubtable(L, 1, z("sub")), 0, "getsubtable makes a missing one")
-    assert_eq(luaL_getsubtable(L, 1, z("sub")), 1, "and finds it the second time")
+    assert_eq(luaL_getsubtable(L, 1, c"sub"), 0, "getsubtable makes a missing one")
+    assert_eq(luaL_getsubtable(L, 1, c"sub"), 1, "and finds it the second time")
     lua_close(L)
 
 @test("the manual's lua_call example, in C's own terms")
@@ -307,16 +304,16 @@ manual_call()
     assert_eq(eval(L, "function f(...) return table.concat({...}, ' ') end  t = {x = 'are'}"), LUA_OK, "set-up")
     lua_settop(L, 0)
 
-    lua_getglobal(L, z("f"))
-    lua_pushstring(L, z("how"))
-    lua_getglobal(L, z("t"))
-    lua_getfield(L, -1, z("x"))
+    lua_getglobal(L, c"f")
+    lua_pushstring(L, c"how")
+    lua_getglobal(L, c"t")
+    lua_getfield(L, -1, c"x")
     lua_remove(L, -2)
     lua_pushinteger(L, 14)
     lua_call(L, 3, 1)
-    lua_setglobal(L, z("a"))
+    lua_setglobal(L, c"a")
 
-    lua_getglobal(L, z("a"))
+    lua_getglobal(L, c"a")
     assert_eq(text_at(L, -1), "how are 14", "a = f(\"how\", t.x, 14)")
     assert_eq(lua_gettop(L), 1, "the stack is back to normal")
     lua_close(L)
@@ -337,57 +334,57 @@ private counter(L: *State) -> int
     1
 
 private raiser(L: *State) -> int
-    lua_pushstring(L, z("raised"))
+    lua_pushstring(L, c"raised")
     lua_error(L)
 
 private formatted(L: *State) -> int
-    luaL_error(L, z("%s=%d"), z("answer"), 42)
+    luaL_error(L, c"%s=%d", c"answer", 42)
 
 private choose(L: *State) -> int
-    var names: [3]*u8 = [z("left"), z("right"), null]
+    var names: [3]*u8 = [c"left", c"right", null]
 
-    lua_pushinteger(L, luaL_checkoption(L, 1, z("right"), &names[0]))
+    lua_pushinteger(L, luaL_checkoption(L, 1, c"right", &names[0]))
 
     1
 
 private strings(L: *State) -> int
     var len: usize = 0
     val s = luaL_checklstring(L, 1, &len)
-    val d = luaL_optlstring(L, 2, z("dflt"), null)
+    val d = luaL_optlstring(L, 2, c"dflt", null)
 
     luaL_checktype(L, 3, LUA_TTABLE)
     luaL_checkany(L, 3)
-    luaL_checkstack(L, 10, z("room"))
-    lua_pushfstring(L, z("%s/%d/%s/%f"), s, int(len), d, luaL_checknumber(L, 4) + luaL_optnumber(L, 5, 0.5))
+    luaL_checkstack(L, 10, c"room")
+    lua_pushfstring(L, c"%s/%d/%s/%f", s, int(len), d, luaL_checknumber(L, 4) + luaL_optnumber(L, 5, 0.5))
 
     1
 
 private bad_arg(L: *State) -> int
-    luaL_argerror(L, 2, z("custom complaint"))
+    luaL_argerror(L, 2, c"custom complaint")
 
 private bad_type(L: *State) -> int
-    luaL_typeerror(L, 1, z("widget"))
+    luaL_typeerror(L, 1, c"widget")
 
 @test("C functions are registered, called and raise as the manual says")
 c_functions()
     val L = fresh()
 
-    lua_register(L, z("add"), &add)
+    lua_register(L, c"add", &add)
     lua_pushinteger(L, 0)
     lua_pushcclosure(L, &counter, 1)
-    lua_setglobal(L, z("counter"))
+    lua_setglobal(L, c"counter")
     lua_pushcfunction(L, &raiser)
-    lua_setglobal(L, z("raiser"))
+    lua_setglobal(L, c"raiser")
     lua_pushcfunction(L, &formatted)
-    lua_setglobal(L, z("formatted"))
+    lua_setglobal(L, c"formatted")
     lua_pushcfunction(L, &choose)
-    lua_setglobal(L, z("choose"))
+    lua_setglobal(L, c"choose")
     lua_pushcfunction(L, &strings)
-    lua_setglobal(L, z("strings"))
+    lua_setglobal(L, c"strings")
     lua_pushcfunction(L, &bad_arg)
-    lua_setglobal(L, z("bad_arg"))
+    lua_setglobal(L, c"bad_arg")
     lua_pushcfunction(L, &bad_type)
-    lua_setglobal(L, z("bad_type"))
+    lua_setglobal(L, c"bad_type")
 
     value(L, "add(2, 3)")
     assert_eq(lua_tointeger(L, -1), 5, "luaL_checkinteger and luaL_optinteger")
@@ -419,7 +416,7 @@ c_functions()
     value(L, "select(2, pcall(strings, 'abc', nil, 1, 1))")
     assert_eq(text_at(L, -1), "bad argument #3 to 'strings' (table expected, got number)", "checktype")
 
-    lua_getglobal(L, z("add"))
+    lua_getglobal(L, c"add")
     assert(lua_iscfunction(L, -1) != 0, "iscfunction")
     assert(lua_tocfunction(L, -1) == &add, "tocfunction hands the pointer back")
     lua_close(L)
@@ -435,7 +432,7 @@ private lib_two(L: *State) -> int
     1
 
 private open_mylib(L: *State) -> int
-    var fns: [3]Reg = [Reg(z("one"), &lib_one), Reg(z("two"), &lib_two), Reg(null, null)]
+    var fns: [3]Reg = [Reg(c"one", &lib_one), Reg(c"two", &lib_two), Reg(null, null)]
 
     // luaL_newlib, written out: the count is the array's less its terminator.
     lua_createtable(L, 0, 2)
@@ -448,7 +445,7 @@ private open_mylib(L: *State) -> int
 libraries()
     val L = fresh()
 
-    luaL_requiref(L, z("mylib"), &open_mylib, 1)
+    luaL_requiref(L, c"mylib", &open_mylib, 1)
     lua_pop(L, 1)
 
     value(L, "mylib.one() + mylib.two()")
@@ -463,19 +460,19 @@ libraries()
 userdata()
     val L = fresh()
 
-    assert(luaL_newmetatable(L, z("Point")) != 0, "a new metatable")
-    assert(luaL_newmetatable(L, z("Point")) == 0, "an existing one is not remade")
+    assert(luaL_newmetatable(L, c"Point") != 0, "a new metatable")
+    assert(luaL_newmetatable(L, c"Point") == 0, "an existing one is not remade")
     lua_settop(L, 0)
 
     val p: *i64 = ptr_cast(lua_newuserdatauv(L, 16, 2))
 
     p[0] = 3
     p[1] = 4
-    luaL_setmetatable(L, z("Point"))
+    luaL_setmetatable(L, c"Point")
 
-    lua_pushstring(L, z("first"))
+    lua_pushstring(L, c"first")
     assert(lua_setiuservalue(L, 1, 1) != 0, "a user value in range")
-    lua_pushstring(L, z("third"))
+    lua_pushstring(L, c"third")
     assert(lua_setiuservalue(L, 1, 3) == 0, "and out of range")
     assert_eq(lua_getiuservalue(L, 1, 1), LUA_TSTRING, "read back")
     assert_eq(text_at(L, -1), "first", "the value")
@@ -484,15 +481,15 @@ userdata()
     assert(lua_isuserdata(L, 1) != 0, "isuserdata")
     assert_eq(lua_rawlen(L, 1), 16, "rawlen is the block's size")
 
-    val back: *i64 = ptr_cast(luaL_checkudata(L, 1, z("Point")))
+    val back: *i64 = ptr_cast(luaL_checkudata(L, 1, c"Point"))
     assert_eq(back[1], 4, "checkudata hands the block back")
-    assert(usize(luaL_testudata(L, 1, z("Other"))) == 0, "testudata refuses another name")
+    assert(usize(luaL_testudata(L, 1, c"Other")) == 0, "testudata refuses another name")
 
     assert(lua_getmetatable(L, 1) != 0, "getmetatable")
-    lua_pushstring(L, z("Point"))
-    lua_setfield(L, -2, z("__name"))
+    lua_pushstring(L, c"Point")
+    lua_setfield(L, -2, c"__name")
     lua_pop(L, 1)
-    assert(luaL_getmetafield(L, 1, z("__name")) == LUA_TSTRING, "getmetafield")
+    assert(luaL_getmetafield(L, 1, c"__name") == LUA_TSTRING, "getmetafield")
     lua_pop(L, 1)
     luaL_tolstring(L, 1, null)
     assert(text_at(L, -1).starts_with("Point: "), "luaL_tolstring uses __name")
@@ -500,7 +497,7 @@ userdata()
 
     lua_newtable(L)
     lua_setmetatable(L, 1)
-    assert(luaL_callmeta(L, 1, z("__tostring")) == 0, "callmeta with no such field")
+    assert(luaL_callmeta(L, 1, c"__tostring") == 0, "callmeta with no such field")
 
     val u: *u8 = lua_newuserdata(L, 8)
     lua_pushinteger(L, 5)
@@ -515,7 +512,7 @@ references()
     val L = luaL_newstate()
 
     lua_newtable(L)
-    lua_pushstring(L, z("held"))
+    lua_pushstring(L, c"held")
     val r = luaL_ref(L, 1)
 
     assert(r > 0, "a reference")
@@ -527,7 +524,7 @@ references()
     assert_eq(luaL_ref(L, 1), LUA_REFNIL, "nil is LUA_REFNIL")
 
     luaL_unref(L, 1, r)
-    lua_pushstring(L, z("again"))
+    lua_pushstring(L, c"again")
     assert_eq(luaL_ref(L, 1), r, "a freed slot is reused")
     luaL_unref(L, 1, LUA_NOREF)
     lua_close(L)
@@ -540,8 +537,8 @@ buffers()
     var b: Buffer = Buffer(null, 0, 0, null, [0; BUFFER_INIT_WORDS])
 
     luaL_buffinit(L, &b)
-    luaL_addlstring(&b, z("abcdef"), 3)
-    luaL_addstring(&b, z("-"))
+    luaL_addlstring(&b, c"abcdef", 3)
+    luaL_addstring(&b, c"-")
     luaL_addchar(&b, u8('x'))
     lua_pushinteger(L, 7)
     luaL_addvalue(&b)
@@ -573,11 +570,11 @@ buffers()
     luaL_addsize(&d, 1)
     luaL_addchar(&d, u8('!'))
     luaL_buffsub(&d, 1)
-    luaL_addgsub(&d, z("a.b"), z("."), z("::"))
+    luaL_addgsub(&d, c"a.b", c".", c"::")
     luaL_pushresult(&d)
     assert_eq(text_at(L, -1), "za::b", "prepbuffer, addsize, buffsub, addgsub")
 
-    assert_eq(cstr(luaL_gsub(L, z("x-y-z"), z("-"), z("+"))), "x+y+z", "luaL_gsub")
+    assert_eq(cstr(luaL_gsub(L, c"x-y-z", c"-", c"+")), "x+y+z", "luaL_gsub")
     lua_close(L)
 
 // -- load, dump, readers and writers --------------------------------------------------------------
@@ -614,7 +611,7 @@ load_dump()
     val src = "local a, b = ... return a * b"
     var source = Source(as_ptr(src.bytes), src.bytes.len, false)
 
-    assert_eq(lua_load(L, &read_chunk, ptr_cast(&source), z("=reader"), null), LUA_OK, "lua_load")
+    assert_eq(lua_load(L, &read_chunk, ptr_cast(&source), c"=reader", null), LUA_OK, "lua_load")
 
     var bytes: Buf[u8] = buf()
 
@@ -625,7 +622,7 @@ load_dump()
     val view = bytes.view()
     var binary = Source(as_ptr(view), view.len, false)
 
-    assert_eq(lua_load(L, &read_chunk, ptr_cast(&binary), z("=bin"), z("b")), LUA_OK, "the binary loads in mode b")
+    assert_eq(lua_load(L, &read_chunk, ptr_cast(&binary), c"=bin", c"b"), LUA_OK, "the binary loads in mode b")
     lua_pushinteger(L, 6)
     lua_pushinteger(L, 7)
     assert_eq(lua_pcall(L, 2, 1, 0), LUA_OK, "and runs")
@@ -634,21 +631,21 @@ load_dump()
 
     var text_again = Source(as_ptr(src.bytes), src.bytes.len, false)
 
-    assert_eq(lua_load(L, &read_chunk, ptr_cast(&text_again), z("=t"), z("b")), LUA_ERRSYNTAX, "a text chunk is refused in mode b")
+    assert_eq(lua_load(L, &read_chunk, ptr_cast(&text_again), c"=t", c"b"), LUA_ERRSYNTAX, "a text chunk is refused in mode b")
     assert(text_at(L, -1).contains("attempt to load a text chunk"), "saying why")
     lua_pop(L, 1)
 
-    assert_eq(luaL_loadstring(L, z("return 1 +")), LUA_ERRSYNTAX, "loadstring reports a syntax error")
+    assert_eq(luaL_loadstring(L, c"return 1 +"), LUA_ERRSYNTAX, "loadstring reports a syntax error")
     lua_pop(L, 1)
-    assert(!luaL_dostring(L, z("x = 5")), "dostring answers false on success")
-    assert(luaL_dostring(L, z("error('e')")), "and true on failure")
+    assert(!luaL_dostring(L, c"x = 5"), "dostring answers false on success")
+    assert(luaL_dostring(L, c"error('e')"), "and true on failure")
     lua_pop(L, 1)
-    assert_eq(luaL_loadbuffer(L, z("return 2"), 8, z("=b")), LUA_OK, "loadbuffer")
+    assert_eq(luaL_loadbuffer(L, c"return 2", 8, c"=b"), LUA_OK, "loadbuffer")
     lua_pop(L, 1)
-    assert_eq(luaL_loadfile(L, z("testdata/greeting.lua")), LUA_OK, "loadfile")
+    assert_eq(luaL_loadfile(L, c"testdata/greeting.lua"), LUA_OK, "loadfile")
     lua_pop(L, 1)
-    assert(!luaL_dofile(L, z("testdata/greeting.lua")), "dofile")
-    assert_eq(luaL_loadfilex(L, z("testdata/none.lua"), null), LUA_ERRFILE, "a missing file is LUA_ERRFILE")
+    assert(!luaL_dofile(L, c"testdata/greeting.lua"), "dofile")
+    assert_eq(luaL_loadfilex(L, c"testdata/none.lua", null), LUA_ERRFILE, "a missing file is LUA_ERRFILE")
     lua_close(L)
 
 // -- errors, tracebacks ---------------------------------------------------------------------------
@@ -666,7 +663,7 @@ tracebacks()
     lua_settop(L, 0)
 
     lua_pushcfunction(L, &traceback_handler)
-    lua_getglobal(L, z("outer"))
+    lua_getglobal(L, c"outer")
     assert_eq(lua_pcall(L, 0, 0, 1), LUA_ERRRUN, "a runtime error")
 
     val tb = text_at(L, -1)
@@ -720,8 +717,8 @@ private where_am_i(L: *State) -> int
 
     if lua_getstack(L, 1, &ar) == 0 then return 0
 
-    lua_getinfo(L, z("nSl"), &ar)
-    lua_pushfstring(L, z("%s:%d:%s"), &ar.short_src[0], ar.currentline, ar.what)
+    lua_getinfo(L, c"nSl", &ar)
+    lua_pushfstring(L, c"%s:%d:%s", &ar.short_src[0], ar.currentline, ar.what)
 
     1
 
@@ -734,7 +731,7 @@ private on_line(L: *State, ar: *Debug)
 debug_info()
     val L = fresh()
 
-    lua_register(L, z("where_am_i"), &where_am_i)
+    lua_register(L, c"where_am_i", &where_am_i)
     eval(L, "local x = 1\nreturn where_am_i()")
     assert_eq(text_at(L, -1), "t:2:main", "short_src, currentline and what")
     lua_settop(L, 0)
@@ -743,7 +740,7 @@ debug_info()
 
     eval(L, "local up = 5 return function(a, b, ...) return up + a end")
     lua_pushvalue(L, -1)
-    lua_getinfo(L, z(">Su"), &ar)
+    lua_getinfo(L, c">Su", &ar)
     assert_eq(ar.nparams, 2, "nparams")
     assert_eq(ar.isvararg, 1, "isvararg")
     assert_eq(ar.nups, 1, "nups")
@@ -867,8 +864,8 @@ warnings()
     var got: Buf[u8] = buf()
 
     lua_setwarnf(L, &warn_into, ptr_cast(&got))
-    lua_warning(L, z("one "), 1)
-    lua_warning(L, z("piece"), 0)
+    lua_warning(L, c"one ", 1)
+    lua_warning(L, c"piece", 0)
     eval(L, "warn('from ', 'lua')")
 
     assert_eq(from_utf8(got.view()).unwrap(), "one piece|from lua|", "tocont joins the pieces")
@@ -892,6 +889,6 @@ to_be_closed()
     eval(L, "closed = false return setmetatable({}, {__close = function() closed = true end})")
     lua_toclose(L, -1)
     lua_closeslot(L, -1)
-    lua_getglobal(L, z("closed"))
+    lua_getglobal(L, c"closed")
     assert(lua_toboolean(L, -1) != 0, "__close ran")
     lua_close(L)

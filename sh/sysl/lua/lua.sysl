@@ -142,7 +142,7 @@ struct State
     // Compiles a chunk without running it, and answers it as a function.
     load(*self, source: string, name: string = "=chunk") -> Result[&Value, Error]
         val label = cstring(name)
-        val status = c.luaL_loadbufferx(self.cur, as_ptr(source.bytes), source.bytes.len, label.ptr, as_ptr(TEXT_MODE.bytes))
+        val status = c.luaL_loadbufferx(self.cur, as_ptr(source.bytes), source.bytes.len, label.ptr, c"t")
 
         if status != c.LUA_OK then return Err(self.failure(status))
 
@@ -151,7 +151,7 @@ struct State
     // Compiles a file. Lua reads it itself, so a missing file is an `ErrorKind.File` naming the path.
     load_file(*self, file: string) -> Result[&Value, Error]
         val path = cstring(file)
-        val status = c.luaL_loadfilex(self.cur, path.ptr, as_ptr(TEXT_MODE.bytes))
+        val status = c.luaL_loadfilex(self.cur, path.ptr, c"t")
 
         if status != c.LUA_OK then return Err(self.failure(status))
 
@@ -320,12 +320,12 @@ struct State
 
         c.lua_pop(self.cur, 1)
 
-        c.lua_getfield(self.cur, c.LUA_REGISTRYINDEX, as_ptr(TRACEBACK.bytes))
+        c.lua_getfield(self.cur, c.LUA_REGISTRYINDEX, c"sh.sysl.lua.traceback")
         val traceback = read_text(self.cur, -1).unwrap_or("")
         c.lua_pop(self.cur, 1)
 
         c.lua_pushnil(self.cur)
-        c.lua_setfield(self.cur, c.LUA_REGISTRYINDEX, as_ptr(TRACEBACK.bytes))
+        c.lua_setfield(self.cur, c.LUA_REGISTRYINDEX, c"sh.sysl.lua.traceback")
 
         Error(error_kind(status), message, traceback)
 
@@ -341,7 +341,8 @@ struct State
 
     private[lua] push_slot(self, slot: int) = c.lua_rawgeti(self.cur, c.LUA_REGISTRYINDEX, slot)
 
-    private[lua] push_text(self, s: string) = c.lua_pushlstring(self.cur, as_ptr(s.bytes), s.bytes.len)
+    private[lua] push_text(self, s: string)
+        val _ = c.lua_pushlstring(self.cur, as_ptr(s.bytes), s.bytes.len)
 
     private[lua] lua(self) -> *c.State = self.cur
 
@@ -758,7 +759,7 @@ private handler(L: *c.State) -> int
     end if
 
     c.luaL_traceback(L, L, null, 1)
-    c.lua_setfield(L, c.LUA_REGISTRYINDEX, as_ptr(TRACEBACK.bytes))
+    c.lua_setfield(L, c.LUA_REGISTRYINDEX, c"sh.sysl.lua.traceback")
     c.lua_settop(L, 1)
 
     1
@@ -771,7 +772,7 @@ private handler(L: *c.State) -> int
 private on_count(L: *c.State, ar: *c.Debug)
     c.lua_sethook(L, &on_count, c.LUA_MASKCOUNT, 1)
     c.luaL_where(L, 0)
-    c.lua_pushstring(L, as_ptr(STEP_LIMIT.bytes))
+    c.lua_pushstring(L, c"the step limit was reached")
     c.lua_concat(L, 2)
     c.lua_error(L)
 
@@ -804,9 +805,6 @@ private extern free(p: *u8)
 
 // ## Small conversions
 
-private val TRACEBACK = "sh.sysl.lua.traceback"
-private val STEP_LIMIT = "the step limit was reached"
-private val TEXT_MODE = "t"
 
 private error_kind(status: int) -> ErrorKind =
     if status == c.LUA_ERRSYNTAX then ErrorKind.Syntax
@@ -846,7 +844,7 @@ private type_name(L: *c.State, idx: int) -> string
 
     // `luaL_getmetafield` pushes nothing where there is no such field, and the field otherwise,
     // whatever its type -- so anything it pushed is popped, string or not.
-    val t = c.luaL_getmetafield(L, at, as_ptr(NAME_FIELD.bytes))
+    val t = c.luaL_getmetafield(L, at, c"__name")
 
     if t != c.LUA_TNIL
         val name = if t == c.LUA_TSTRING then read_text(L, -1) else None
@@ -862,7 +860,6 @@ private type_name(L: *c.State, idx: int) -> string
 
     read_cstring(c.luaL_typename(L, at))
 
-private val NAME_FIELD = "__name"
 
 private to_integer(L: *c.State, idx: int) -> Result[i64, Error]
     var ok: int = 0
